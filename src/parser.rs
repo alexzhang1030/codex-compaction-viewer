@@ -1,0 +1,694 @@
+use anyhow::{Context, Result};
+use serde::Serialize;
+use serde_json::{Map, Value};
+use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+const EMPTY_SUMMARY_VALUES: &[&str] = &["", "auto", "manual", "null", "none", "nil"];
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub path: PathBuf,
+    pub session_id: String,
+    pub cwd: String,
+    pub started_at: String,
+    pub cli_version: String,
+    pub model_provider: String,
+}
+
+impl SessionMetadata {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            session_id: String::new(),
+            cwd: String::new(),
+            started_at: String::new(),
+            cli_version: String::new(),
+            model_provider: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ParsedMessage {
+    pub line_number: usize,
+    pub timestamp: String,
+    pub record_type: String,
+    pub kind: String,
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CompactionEvent {
+    pub line_number: usize,
+    pub timestamp: String,
+    pub turn_id: String,
+    pub summary: String,
+    pub truncation_mode: String,
+    pub truncation_limit: Option<i64>,
+    pub token_usage: Option<TokenUsage>,
+    pub source: String,
+    pub boundary_line_number: Option<usize>,
+    pub trigger: String,
+}
+
+impl CompactionEvent {
+    pub fn summary_length(&self) -> usize {
+        self.summary.chars().count()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ConversationStats {
+    pub line_count: usize,
+    pub bad_lines: usize,
+    pub message_count: usize,
+    pub token_count_events: usize,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+    pub model_context_window: i64,
+    pub first_timestamp: String,
+    pub last_timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ParsedSession {
+    pub metadata: SessionMetadata,
+    pub messages: Vec<ParsedMessage>,
+    pub compaction_events: Vec<CompactionEvent>,
+    pub stats: ConversationStats,
+}
+
+impl ParsedSession {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            metadata: SessionMetadata::new(path),
+            messages: Vec::new(),
+            compaction_events: Vec::new(),
+            stats: ConversationStats::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingBoundary {
+    line_number: usize,
+    timestamp: String,
+    trigger: String,
+    token_usage: Option<TokenUsage>,
+}
+
+pub fn discover_sessions(root: Option<&Path>, include_archived: bool) -> Result<Vec<PathBuf>> {
+    let base = match root {
+        Some(path) => path.to_path_buf(),
+        None => env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set")?
+            .join(".codex"),
+    };
+
+    let mut directories = vec![base.join("sessions")];
+    if include_archived {
+        directories.push(base.join("archived_sessions"));
+    }
+
+    let mut files = Vec::new();
+    for directory in directories {
+        if !directory.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(directory).into_iter().filter_map(Result::ok) {
+            if entry.file_type().is_file()
+                && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            {
+                files.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+pub fn parse_many(paths: &[PathBuf]) -> Result<Vec<ParsedSession>> {
+    paths.iter().map(parse_jsonl).collect()
+}
+
+pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
+    let session_path = path.as_ref().to_path_buf();
+    let file = File::open(&session_path)
+        .with_context(|| format!("failed to open {}", session_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut parsed = ParsedSession::new(session_path);
+    let mut latest_token_usage: Option<TokenUsage> = None;
+    let mut pending_boundary: Option<PendingBoundary> = None;
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        parsed.stats.line_count += 1;
+        let line = line?;
+        let record: Value = match serde_json::from_str(&line) {
+            Ok(record) => record,
+            Err(_) => {
+                parsed.stats.bad_lines += 1;
+                continue;
+            }
+        };
+        let Some(record) = record.as_object() else {
+            parsed.stats.bad_lines += 1;
+            continue;
+        };
+
+        let timestamp = string(record.get("timestamp"));
+        if !timestamp.is_empty() {
+            update_time_bounds(&mut parsed.stats, &timestamp);
+        }
+
+        let record_type = string(record.get("type"));
+        let payload = record.get("payload").and_then(Value::as_object);
+        let payload_empty = payload.map(Map::is_empty).unwrap_or(true);
+        let empty_payload = Map::new();
+        let payload = payload.unwrap_or(&empty_payload);
+
+        match record_type.as_str() {
+            "session_meta" => {
+                pending_boundary = None;
+                apply_session_meta(&mut parsed.metadata, payload, &timestamp);
+            }
+            "turn_context" => {
+                pending_boundary = None;
+                if let Some(event) =
+                    parse_turn_context(line_number, &timestamp, payload, latest_token_usage.clone())
+                {
+                    parsed.compaction_events.push(event);
+                }
+                parsed
+                    .messages
+                    .push(message_from_turn_context(line_number, &timestamp, payload));
+            }
+            "event_msg" => {
+                pending_boundary = None;
+                parsed
+                    .messages
+                    .push(message_from_event(line_number, &timestamp, payload));
+                if string(payload.get("type")) == "token_count" {
+                    parsed.stats.token_count_events += 1;
+                    latest_token_usage = apply_token_count(&mut parsed.stats, payload);
+                }
+            }
+            "response_item" => {
+                pending_boundary = None;
+                parsed
+                    .messages
+                    .push(message_from_response_item(line_number, &timestamp, payload));
+            }
+            _ if payload_empty => {
+                if let Some(boundary) = parse_raw_boundary(line_number, &timestamp, record) {
+                    pending_boundary = Some(boundary);
+                    parsed
+                        .messages
+                        .push(message_from_raw_record(line_number, &timestamp, record));
+                } else if is_raw_compact_summary(record) {
+                    if let Some(event) = parse_raw_compact_summary(
+                        line_number,
+                        &timestamp,
+                        record,
+                        pending_boundary.as_ref(),
+                    ) {
+                        parsed.compaction_events.push(event);
+                    }
+                    pending_boundary = None;
+                    parsed
+                        .messages
+                        .push(message_from_raw_record(line_number, &timestamp, record));
+                } else if matches!(record_type.as_str(), "system" | "user" | "assistant") {
+                    pending_boundary = None;
+                    parsed
+                        .messages
+                        .push(message_from_raw_record(line_number, &timestamp, record));
+                } else {
+                    pending_boundary = None;
+                    parsed.messages.push(ParsedMessage {
+                        line_number,
+                        timestamp,
+                        record_type: record_type.clone(),
+                        kind: record_type,
+                        role: String::new(),
+                        content: String::new(),
+                    });
+                }
+            }
+            _ => {
+                pending_boundary = None;
+                parsed.messages.push(ParsedMessage {
+                    line_number,
+                    timestamp,
+                    record_type,
+                    kind: string(payload.get("type")),
+                    role: String::new(),
+                    content: String::new(),
+                });
+            }
+        }
+    }
+
+    parsed.stats.message_count = parsed.messages.len();
+    Ok(parsed)
+}
+
+fn apply_session_meta(
+    metadata: &mut SessionMetadata,
+    payload: &Map<String, Value>,
+    timestamp: &str,
+) {
+    assign_if_present(&mut metadata.session_id, string(payload.get("id")));
+    assign_if_present(&mut metadata.cwd, string(payload.get("cwd")));
+    assign_if_present(
+        &mut metadata.cli_version,
+        string(payload.get("cli_version")),
+    );
+    assign_if_present(
+        &mut metadata.model_provider,
+        string(payload.get("model_provider")),
+    );
+    if !timestamp.is_empty() {
+        metadata.started_at = timestamp.to_string();
+    } else {
+        assign_if_present(&mut metadata.started_at, string(payload.get("timestamp")));
+    }
+}
+
+fn parse_turn_context(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+    latest_token_usage: Option<TokenUsage>,
+) -> Option<CompactionEvent> {
+    let summary = summary_text(payload.get("summary"));
+    if summary.is_empty() {
+        return None;
+    }
+
+    let policy = payload.get("truncation_policy").and_then(Value::as_object);
+
+    Some(CompactionEvent {
+        line_number,
+        timestamp: timestamp.to_string(),
+        turn_id: string(payload.get("turn_id")),
+        summary,
+        truncation_mode: policy.map(|p| string(p.get("mode"))).unwrap_or_default(),
+        truncation_limit: policy.and_then(|p| int_or_none(p.get("limit"))),
+        token_usage: latest_token_usage,
+        source: "turn_context".to_string(),
+        boundary_line_number: None,
+        trigger: String::new(),
+    })
+}
+
+fn parse_raw_boundary(
+    line_number: usize,
+    timestamp: &str,
+    record: &Map<String, Value>,
+) -> Option<PendingBoundary> {
+    if string(record.get("type")) != "system" || string(record.get("subtype")) != "compact_boundary"
+    {
+        return None;
+    }
+
+    let metadata = record
+        .get("compactMetadata")
+        .or_else(|| record.get("compact_metadata"))
+        .and_then(Value::as_object);
+
+    let token_count = metadata.and_then(|metadata| {
+        first_int(
+            metadata,
+            &[
+                "preCompactTokens",
+                "pre_compact_tokens",
+                "tokensBefore",
+                "tokens_before",
+                "totalTokens",
+                "total_tokens",
+            ],
+        )
+    });
+    let token_usage = token_count.map(|total_tokens| TokenUsage {
+        total_tokens,
+        ..TokenUsage::default()
+    });
+
+    Some(PendingBoundary {
+        line_number,
+        timestamp: timestamp.to_string(),
+        trigger: metadata
+            .map(|m| string(m.get("trigger")))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| string(record.get("trigger"))),
+        token_usage,
+    })
+}
+
+fn parse_raw_compact_summary(
+    line_number: usize,
+    timestamp: &str,
+    record: &Map<String, Value>,
+    boundary: Option<&PendingBoundary>,
+) -> Option<CompactionEvent> {
+    let summary = [
+        summary_text(record.get("summary")),
+        summary_text(record.get("compactSummary")),
+        summary_text(record.get("compact_summary")),
+        summary_text_from_string(message_text(record.get("message"))),
+        summary_text(record.get("content")),
+    ]
+    .into_iter()
+    .find(|summary| !summary.is_empty())
+    .unwrap_or_default();
+
+    if summary.is_empty() {
+        return None;
+    }
+
+    Some(CompactionEvent {
+        line_number,
+        timestamp: timestamp.to_string(),
+        turn_id: string(record.get("uuid")).or_else_empty(string(record.get("id"))),
+        summary,
+        truncation_mode: String::new(),
+        truncation_limit: None,
+        token_usage: boundary.and_then(|boundary| boundary.token_usage.clone()),
+        source: if boundary.is_some() {
+            "boundary_summary"
+        } else {
+            "compact_summary"
+        }
+        .to_string(),
+        boundary_line_number: boundary.map(|boundary| boundary.line_number),
+        trigger: boundary
+            .map(|boundary| boundary.trigger.clone())
+            .filter(|trigger| !trigger.is_empty())
+            .unwrap_or_else(|| string(record.get("trigger"))),
+    })
+}
+
+fn is_raw_compact_summary(record: &Map<String, Value>) -> bool {
+    string(record.get("type")) == "user"
+        && record
+            .get("isCompactSummary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn message_from_turn_context(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+) -> ParsedMessage {
+    let policy_text = payload
+        .get("truncation_policy")
+        .and_then(Value::as_object)
+        .map(|policy| {
+            let mode = string(policy.get("mode"));
+            let limit = string(policy.get("limit"));
+            if mode.is_empty() && limit.is_empty() {
+                String::new()
+            } else {
+                format!("{mode}:{limit}")
+            }
+        })
+        .unwrap_or_default();
+
+    ParsedMessage {
+        line_number,
+        timestamp: timestamp.to_string(),
+        record_type: "turn_context".to_string(),
+        kind: "turn_context".to_string(),
+        role: "system".to_string(),
+        content: policy_text,
+    }
+}
+
+fn message_from_event(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+) -> ParsedMessage {
+    let kind = string(payload.get("type"));
+    let (role, content) = match kind.as_str() {
+        "user_message" => ("user".to_string(), string(payload.get("message"))),
+        "agent_message" => ("assistant".to_string(), string(payload.get("message"))),
+        "exec_command_end" => {
+            let status =
+                string(payload.get("status")).or_else_empty(string(payload.get("exit_code")));
+            let command_text = match payload.get("command") {
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .map(|part| string(Some(part)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                other => string(other),
+            };
+            (
+                "tool".to_string(),
+                format!("{command_text} {status}").trim().to_string(),
+            )
+        }
+        "token_count" => {
+            let total_tokens = payload
+                .get("info")
+                .and_then(Value::as_object)
+                .and_then(|info| info.get("total_token_usage"))
+                .and_then(Value::as_object)
+                .map(|usage| string(usage.get("total_tokens")))
+                .unwrap_or_default();
+            let content = if total_tokens.is_empty() {
+                String::new()
+            } else {
+                format!("tokens={total_tokens}")
+            };
+            ("system".to_string(), content)
+        }
+        _ => (
+            "system".to_string(),
+            string(payload.get("message")).or_else_empty(string(payload.get("text"))),
+        ),
+    };
+
+    ParsedMessage {
+        line_number,
+        timestamp: timestamp.to_string(),
+        record_type: "event_msg".to_string(),
+        kind,
+        role,
+        content,
+    }
+}
+
+fn message_from_response_item(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+) -> ParsedMessage {
+    let kind = string(payload.get("type"));
+    let (role, content) = match kind.as_str() {
+        "function_call" => ("tool_call".to_string(), string(payload.get("name"))),
+        "function_call_output" => ("tool".to_string(), string(payload.get("call_id"))),
+        _ => (
+            string(payload.get("role")),
+            content_text(payload.get("content")),
+        ),
+    };
+
+    ParsedMessage {
+        line_number,
+        timestamp: timestamp.to_string(),
+        record_type: "response_item".to_string(),
+        kind,
+        role,
+        content,
+    }
+}
+
+fn message_from_raw_record(
+    line_number: usize,
+    timestamp: &str,
+    record: &Map<String, Value>,
+) -> ParsedMessage {
+    let record_type = string(record.get("type"));
+    let subtype = string(record.get("subtype"));
+    let mut content =
+        message_text(record.get("message")).or_else_empty(summary_text(record.get("content")));
+    if subtype == "compact_boundary" {
+        let trigger = record
+            .get("compactMetadata")
+            .and_then(Value::as_object)
+            .map(|metadata| string(metadata.get("trigger")))
+            .unwrap_or_default();
+        content = format!("compact boundary {trigger}").trim().to_string();
+    }
+
+    ParsedMessage {
+        line_number,
+        timestamp: timestamp.to_string(),
+        record_type: record_type.clone(),
+        kind: subtype.or_else_empty(record_type.clone()),
+        role: record_type,
+        content,
+    }
+}
+
+fn apply_token_count(
+    stats: &mut ConversationStats,
+    payload: &Map<String, Value>,
+) -> Option<TokenUsage> {
+    let info = payload.get("info")?.as_object()?;
+    if let Some(window) = int_or_none(info.get("model_context_window")) {
+        stats.model_context_window = window;
+    }
+
+    let usage = token_usage(info.get("total_token_usage"))?;
+    stats.input_tokens = usage.input_tokens;
+    stats.cached_input_tokens = usage.cached_input_tokens;
+    stats.output_tokens = usage.output_tokens;
+    stats.reasoning_output_tokens = usage.reasoning_output_tokens;
+    stats.total_tokens = usage.total_tokens;
+    Some(usage)
+}
+
+fn token_usage(value: Option<&Value>) -> Option<TokenUsage> {
+    let value = value?.as_object()?;
+    Some(TokenUsage {
+        input_tokens: int(value.get("input_tokens")),
+        cached_input_tokens: int(value.get("cached_input_tokens")),
+        output_tokens: int(value.get("output_tokens")),
+        reasoning_output_tokens: int(value.get("reasoning_output_tokens")),
+        total_tokens: int(value.get("total_tokens")),
+    })
+}
+
+fn content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(value) => Some(value.clone()),
+                Value::Object(object) => {
+                    let text =
+                        string(object.get("text")).or_else_empty(string(object.get("summary")));
+                    (!text.is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn message_text(message: Option<&Value>) -> String {
+    match message {
+        Some(Value::Object(object)) => content_text(object.get("content"))
+            .or_else_empty(string(object.get("text")))
+            .or_else_empty(string(object.get("summary"))),
+        other => content_text(other),
+    }
+}
+
+fn summary_text(value: Option<&Value>) -> String {
+    let summary = match value {
+        Some(Value::String(value)) => value.trim().to_string(),
+        Some(Value::Array(_)) => content_text(value).trim().to_string(),
+        Some(Value::Object(object)) => string(object.get("text"))
+            .or_else_empty(string(object.get("summary")))
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    };
+
+    summary_text_from_string(summary)
+}
+
+fn summary_text_from_string(summary: String) -> String {
+    let summary = summary.trim().to_string();
+    if EMPTY_SUMMARY_VALUES
+        .iter()
+        .any(|empty| summary.eq_ignore_ascii_case(empty))
+    {
+        String::new()
+    } else {
+        summary
+    }
+}
+
+fn update_time_bounds(stats: &mut ConversationStats, timestamp: &str) {
+    if stats.first_timestamp.is_empty() || timestamp < stats.first_timestamp.as_str() {
+        stats.first_timestamp = timestamp.to_string();
+    }
+    if stats.last_timestamp.is_empty() || timestamp > stats.last_timestamp.as_str() {
+        stats.last_timestamp = timestamp.to_string();
+    }
+}
+
+fn string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn int(value: Option<&Value>) -> i64 {
+    int_or_none(value).unwrap_or(0)
+}
+
+fn int_or_none(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .or_else(|| value.as_u64().map(|value| value as i64)),
+        Some(Value::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn first_int(values: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| int_or_none(values.get(*key)))
+}
+
+fn assign_if_present(target: &mut String, value: String) {
+    if !value.is_empty() {
+        *target = value;
+    }
+}
+
+trait EmptyFallback {
+    fn or_else_empty(self, fallback: String) -> String;
+}
+
+impl EmptyFallback for String {
+    fn or_else_empty(self, fallback: String) -> String {
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
+    }
+}

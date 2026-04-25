@@ -1,0 +1,25 @@
+[package]
+name = "codex-compaction-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Inspect Codex JSONL sessions for context summaries, token usage, and truncation signals."
+license = "MIT"
+repository = "https://github.com/alexzhang1030/codex-compaction-viewer"
+
+[lib]
+name = "codex_compaction_viewer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cxv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.10"

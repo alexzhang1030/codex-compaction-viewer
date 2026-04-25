@@ -2,6 +2,8 @@
 
 Inspect local Codex JSONL sessions for context summary snapshots, token usage, and truncation policy metadata.
 
+`cxv` is a Rust binary. It does not require Python at runtime.
+
 The parser supports two compaction shapes:
 
 - Codex `turn_context.summary` records, reported with turn id, truncation policy, and nearest preceding token usage when available.
@@ -9,8 +11,23 @@ The parser supports two compaction shapes:
 
 ## Install
 
+Install from a published GitHub release:
+
 ```bash
-pip install .
+curl -fsSL https://raw.githubusercontent.com/alexzhang1030/codex-compaction-viewer/main/scripts/install.sh | sh
+```
+
+Install from source if you already have Rust:
+
+```bash
+cargo install --git https://github.com/alexzhang1030/codex-compaction-viewer
+```
+
+Build a local single executable:
+
+```bash
+cargo build --release
+./target/release/cxv --help
 ```
 
 ## Usage
@@ -57,6 +74,6 @@ The parser streams JSONL line-by-line and tolerates bad JSON rows so large or pa
 ## Development
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-PYTHONPATH=src python3 -m codex_compaction_viewer --scan --include-archived
+cargo test
+cargo run -- --scan --include-archived
 ```
