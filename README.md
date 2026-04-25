@@ -11,7 +11,7 @@ The parser supports two compaction shapes:
 
 ## Install
 
-Install from a published GitHub release:
+Install a prebuilt macOS binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alexzhang1030/codex-compaction-viewer/main/scripts/install.sh | sh
@@ -23,7 +23,7 @@ Install from source if you already have Rust:
 cargo install --git https://github.com/alexzhang1030/codex-compaction-viewer
 ```
 
-Build a local single executable:
+Build a local single executable for any supported Rust target:
 
 ```bash
 cargo build --release

@@ -20,15 +20,22 @@ esac
 
 if [ "$version" = "latest" ]; then
   url="https://github.com/$repo/releases/latest/download/$asset"
+  fallback_url="https://raw.githubusercontent.com/$repo/main/dist/$asset"
 else
   url="https://github.com/$repo/releases/download/$version/$asset"
+  fallback_url=""
 fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 mkdir -p "$bin_dir"
-curl -fsSL "$url" -o "$tmp_dir/$asset"
+if ! curl -fsSL "$url" -o "$tmp_dir/$asset" 2>/dev/null; then
+  if [ -z "$fallback_url" ]; then
+    exit 1
+  fi
+  curl -fsSL "$fallback_url" -o "$tmp_dir/$asset"
+fi
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
 install -m 0755 "$tmp_dir/cxv" "$bin_dir/cxv"
 
