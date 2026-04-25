@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use serde::Serialize;
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -33,6 +34,10 @@ pub struct Args {
     /// Emit structured JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Launch the interactive terminal viewer. Pass a positional FILE to open it directly.
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,7 +83,31 @@ struct EventOutput {
 }
 
 pub fn main_entry() -> i32 {
-    match run_from(std::env::args_os()) {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let args = match Args::try_parse_from(raw_args.clone()) {
+        Ok(args) => args,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return code;
+        }
+    };
+
+    if should_launch_tui(&args, raw_args.len()) {
+        return match crate::tui::launch(
+            args.root.as_deref(),
+            args.include_archived,
+            args.file.as_deref(),
+        ) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("cxv: {error:#}");
+                1
+            }
+        };
+    }
+
+    match run(args) {
         Ok(output) => {
             print!("{output}");
             0
@@ -88,6 +117,12 @@ pub fn main_entry() -> i32 {
             1
         }
     }
+}
+
+fn should_launch_tui(args: &Args, arg_count: usize) -> bool {
+    (args.tui || arg_count == 1)
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
 }
 
 pub fn run_from<I, T>(args: I) -> Result<String>
@@ -100,6 +135,12 @@ where
 }
 
 pub fn run(args: Args) -> Result<String> {
+    if args.tui {
+        return Ok(
+            "Interactive TUI requires a terminal. Run `cxv --tui` from a TTY.\n".to_string(),
+        );
+    }
+
     if let Some(summary) = args.summary {
         let parsed = parse_jsonl(summary)?;
         if args.json {

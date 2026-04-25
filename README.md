@@ -32,6 +32,18 @@ cargo build --release
 
 ## Usage
 
+Launch the interactive terminal viewer:
+
+```bash
+cxv
+```
+
+Open the interactive viewer for one session:
+
+```bash
+cxv --tui ~/.codex/sessions/2026/04/25/rollout-example.jsonl
+```
+
 Scan active Codex sessions:
 
 ```bash
@@ -61,6 +73,27 @@ Inspect one session:
 ```bash
 cxv ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 ```
+
+### Interactive TUI
+
+The TUI shows:
+
+- Left sidebar: discovered Codex session files, newest first.
+- Stats panel: message count, line count, compactions, token totals, context window, source path.
+- Compaction panel: highlighted compaction events and summary sizes.
+- History table: normalized Codex messages/events with compaction rows marked by `*`.
+- Detail panel: full selected message metadata/content, or all compaction summaries.
+
+Keybindings:
+
+| Key | Action |
+| --- | --- |
+| `h` / `l` or left / right | Previous / next session |
+| `j` / `k` or up / down | Move through conversation history |
+| `c` / `C` | Jump to next / previous compaction point |
+| `s` | Toggle all compaction summaries in the detail panel |
+| `t` | Toggle token-count events |
+| `q` or `Esc` | Quit |
 
 ## Data Model
 
