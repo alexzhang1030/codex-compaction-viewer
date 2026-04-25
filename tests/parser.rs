@@ -17,6 +17,151 @@ fn write_jsonl(path: &Path, rows: Vec<serde_json::Value>) {
 }
 
 #[test]
+fn parse_jsonl_skips_blank_rows_and_unwraps_string_encoded_events() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("wrapped-events.jsonl");
+    let wrapped_turn_context = json!({
+        "timestamp": "2026-04-25T12:01:00Z",
+        "type": "turn_context",
+        "payload": {
+            "turn_id": "turn-wrapped",
+            "summary": "Compaction summary from a quoted JSONL event.",
+            "truncation_policy": {"mode": "tokens", "limit": 8000}
+        }
+    })
+    .to_string();
+    fs::write(
+        &session,
+        format!(
+            "\n  \n{}\n{}\n{{not-json}}\n",
+            json!({
+                "timestamp": "2026-04-25T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "sess-wrapped", "cwd": "/repo"}
+            }),
+            serde_json::to_string(&wrapped_turn_context).expect("quote event")
+        ),
+    )
+    .expect("write fixture");
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+
+    assert_eq!(parsed.metadata.session_id, "sess-wrapped");
+    assert_eq!(parsed.stats.line_count, 5);
+    assert_eq!(parsed.stats.bad_lines, 1);
+    assert_eq!(parsed.compaction_events.len(), 1);
+    let event = &parsed.compaction_events[0];
+    assert_eq!(event.line_number, 4);
+    assert_eq!(event.turn_id, "turn-wrapped");
+    assert!(event.summary.contains("quoted JSONL event"));
+}
+
+#[test]
+fn parse_jsonl_deduplicates_event_messages_when_response_items_exist() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("deduped.jsonl");
+    write_jsonl(
+        &session,
+        vec![
+            json!({
+                "timestamp": "2026-04-25T12:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "duplicate user event"}
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "canonical user message"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "duplicate assistant event"}
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "canonical assistant message"}]
+                }
+            }),
+        ],
+    );
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+    let contents = parsed
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(contents.contains(&"canonical user message"));
+    assert!(contents.contains(&"canonical assistant message"));
+    assert!(!contents.contains(&"duplicate user event"));
+    assert!(!contents.contains(&"duplicate assistant event"));
+}
+
+#[test]
+fn parse_jsonl_uses_tool_arguments_and_outputs_as_message_content() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("tools.jsonl");
+    write_jsonl(
+        &session,
+        vec![
+            json!({
+                "timestamp": "2026-04-25T12:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call-1",
+                    "arguments": "{\"cmd\":\"cargo test --test parser\"}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "{\"exit_code\":0,\"stdout\":\"parser ok\"}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Use structured JSONL parsing."}]
+                }
+            }),
+        ],
+    );
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+
+    assert!(parsed.messages.iter().any(|message| {
+        message.kind == "function_call"
+            && message.role == "tool_call"
+            && message.content.contains("cargo test --test parser")
+    }));
+    assert!(parsed.messages.iter().any(|message| {
+        message.kind == "function_call_output"
+            && message.role == "tool"
+            && message.content.contains("parser ok")
+    }));
+    assert!(parsed.messages.iter().any(|message| {
+        message.kind == "reasoning" && message.content.contains("structured JSONL parsing")
+    }));
+}
+
+#[test]
 fn parse_jsonl_extracts_codex_context_summary_event() {
     let tmp = TempDir::new().expect("tempdir");
     let session = tmp.path().join("rollout-2026-04-25T12-00-00-example.jsonl");

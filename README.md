@@ -109,7 +109,7 @@ Keybindings:
 - `CompactionEvent`: compact summary with line, optional boundary line, source type, trigger, summary text, truncation policy, and token usage.
 - `ConversationStats`: line counts, bad JSON count, token totals, model context window, and time bounds.
 
-The parser streams JSONL line-by-line and tolerates bad JSON rows so large or partially-written sessions remain inspectable.
+The parser follows the same resilient JSON/JSONL loading shape used by Euphony: it accepts normal object rows, skips blank rows, tolerates malformed rows, unwraps string-encoded JSON events, and keeps canonical `response_item` messages ahead of legacy fallback `event_msg` duplicates. This keeps large or partially-written sessions inspectable while making the TUI history less noisy.
 
 ## Development
 

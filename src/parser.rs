@@ -114,6 +114,26 @@ struct PendingBoundary {
     token_usage: Option<TokenUsage>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LoadedRecords {
+    records: Vec<JsonRecord>,
+    line_count: usize,
+    bad_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+struct JsonRecord {
+    line_number: usize,
+    record: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResponseItemCoverage {
+    user_messages: bool,
+    assistant_messages: bool,
+    reasoning: bool,
+}
+
 pub fn discover_sessions(root: Option<&Path>, include_archived: bool) -> Result<Vec<PathBuf>> {
     let base = match root {
         Some(path) => path.to_path_buf(),
@@ -151,30 +171,20 @@ pub fn parse_many(paths: &[PathBuf]) -> Result<Vec<ParsedSession>> {
 
 pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
     let session_path = path.as_ref().to_path_buf();
-    let file = File::open(&session_path)
-        .with_context(|| format!("failed to open {}", session_path.display()))?;
-    let reader = BufReader::new(file);
+    let loaded = load_records(&session_path)?;
+    let coverage = response_item_coverage(&loaded.records);
     let mut parsed = ParsedSession::new(session_path);
+    parsed.stats.line_count = loaded.line_count;
+    parsed.stats.bad_lines = loaded.bad_lines;
     let mut latest_token_usage: Option<TokenUsage> = None;
     let mut pending_boundary: Option<PendingBoundary> = None;
     let mut legacy_context_compacted_events: Vec<CompactionEvent> = Vec::new();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line_number = line_index + 1;
-        parsed.stats.line_count += 1;
-        let line = line?;
-        let record: Value = match serde_json::from_str(&line) {
-            Ok(record) => record,
-            Err(_) => {
-                parsed.stats.bad_lines += 1;
-                continue;
-            }
-        };
-        let Some(record) = record.as_object() else {
-            parsed.stats.bad_lines += 1;
-            continue;
-        };
-
+    for JsonRecord {
+        line_number,
+        record,
+    } in loaded.records
+    {
         let timestamp = string(record.get("timestamp"));
         if !timestamp.is_empty() {
             update_time_bounds(&mut parsed.stats, &timestamp);
@@ -216,13 +226,16 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
             }
             "event_msg" => {
                 pending_boundary = None;
-                parsed
-                    .messages
-                    .push(message_from_event(line_number, &timestamp, payload));
-                if string(payload.get("type")) == "token_count" {
+                let payload_type = string(payload.get("type"));
+                if should_include_event_message(&payload_type, coverage) {
+                    parsed
+                        .messages
+                        .push(message_from_event(line_number, &timestamp, payload));
+                }
+                if payload_type == "token_count" {
                     parsed.stats.token_count_events += 1;
                     latest_token_usage = apply_token_count(&mut parsed.stats, payload);
-                } else if string(payload.get("type")) == "context_compacted" {
+                } else if payload_type == "context_compacted" {
                     legacy_context_compacted_events.push(parse_legacy_context_compacted(
                         line_number,
                         &timestamp,
@@ -237,16 +250,16 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
                     .push(message_from_response_item(line_number, &timestamp, payload));
             }
             _ if payload_empty => {
-                if let Some(boundary) = parse_raw_boundary(line_number, &timestamp, record) {
+                if let Some(boundary) = parse_raw_boundary(line_number, &timestamp, &record) {
                     pending_boundary = Some(boundary);
                     parsed
                         .messages
-                        .push(message_from_raw_record(line_number, &timestamp, record));
-                } else if is_raw_compact_summary(record) {
+                        .push(message_from_raw_record(line_number, &timestamp, &record));
+                } else if is_raw_compact_summary(&record) {
                     if let Some(event) = parse_raw_compact_summary(
                         line_number,
                         &timestamp,
-                        record,
+                        &record,
                         pending_boundary.as_ref(),
                     ) {
                         parsed.compaction_events.push(event);
@@ -254,12 +267,12 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
                     pending_boundary = None;
                     parsed
                         .messages
-                        .push(message_from_raw_record(line_number, &timestamp, record));
+                        .push(message_from_raw_record(line_number, &timestamp, &record));
                 } else if matches!(record_type.as_str(), "system" | "user" | "assistant") {
                     pending_boundary = None;
                     parsed
                         .messages
-                        .push(message_from_raw_record(line_number, &timestamp, record));
+                        .push(message_from_raw_record(line_number, &timestamp, &record));
                 } else {
                     pending_boundary = None;
                     parsed.messages.push(ParsedMessage {
@@ -297,6 +310,110 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
         .sort_by_key(|event| event.line_number);
     parsed.stats.message_count = parsed.messages.len();
     Ok(parsed)
+}
+
+fn load_records(path: &Path) -> Result<LoadedRecords> {
+    if let Some(records) = load_json_document_records(path)? {
+        return Ok(records);
+    }
+
+    load_jsonl_records(path)
+}
+
+fn load_json_document_records(path: &Path) -> Result<Option<LoadedRecords>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let value: Value = match serde_json::from_reader(reader) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let mut loaded = LoadedRecords::default();
+    match value {
+        Value::Array(items) => {
+            loaded.line_count = items.len();
+            for (index, item) in items.into_iter().enumerate() {
+                push_normalized_record(&mut loaded, index + 1, item);
+            }
+        }
+        item => {
+            loaded.line_count = 1;
+            push_normalized_record(&mut loaded, 1, item);
+        }
+    }
+
+    Ok(Some(loaded))
+}
+
+fn load_jsonl_records(path: &Path) -> Result<LoadedRecords> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut loaded = LoadedRecords::default();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        loaded.line_count += 1;
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => push_normalized_record(&mut loaded, line_number, value),
+            Err(_) => loaded.bad_lines += 1,
+        }
+    }
+
+    Ok(loaded)
+}
+
+fn push_normalized_record(loaded: &mut LoadedRecords, line_number: usize, value: Value) {
+    match value {
+        Value::Object(record) => loaded.records.push(JsonRecord {
+            line_number,
+            record,
+        }),
+        Value::String(raw) => match serde_json::from_str::<Value>(raw.trim()) {
+            Ok(Value::Object(record)) => loaded.records.push(JsonRecord {
+                line_number,
+                record,
+            }),
+            _ => loaded.bad_lines += 1,
+        },
+        _ => loaded.bad_lines += 1,
+    }
+}
+
+fn response_item_coverage(records: &[JsonRecord]) -> ResponseItemCoverage {
+    let mut coverage = ResponseItemCoverage::default();
+    for item in records {
+        if string(item.record.get("type")) != "response_item" {
+            continue;
+        }
+        let payload = item.record.get("payload").and_then(Value::as_object);
+        let Some(payload) = payload else {
+            continue;
+        };
+        match string(payload.get("type")).as_str() {
+            "message" => match string(payload.get("role")).as_str() {
+                "user" => coverage.user_messages = true,
+                "assistant" => coverage.assistant_messages = true,
+                _ => {}
+            },
+            "reasoning" => coverage.reasoning = true,
+            _ => {}
+        }
+    }
+    coverage
+}
+
+fn should_include_event_message(kind: &str, coverage: ResponseItemCoverage) -> bool {
+    match kind {
+        "user_message" => !coverage.user_messages,
+        "agent_message" => !coverage.assistant_messages,
+        "agent_reasoning" => !coverage.reasoning,
+        _ => true,
+    }
 }
 
 fn apply_session_meta(
@@ -539,6 +656,10 @@ fn message_from_event(
     let (role, content) = match kind.as_str() {
         "user_message" => ("user".to_string(), string(payload.get("message"))),
         "agent_message" => ("assistant".to_string(), string(payload.get("message"))),
+        "agent_reasoning" => (
+            "assistant".to_string(),
+            string(payload.get("text")).or_else_empty(string(payload.get("message"))),
+        ),
         "exec_command_end" => {
             let status =
                 string(payload.get("status")).or_else_empty(string(payload.get("exit_code")));
@@ -593,8 +714,17 @@ fn message_from_response_item(
 ) -> ParsedMessage {
     let kind = string(payload.get("type"));
     let (role, content) = match kind.as_str() {
-        "function_call" => ("tool_call".to_string(), string(payload.get("name"))),
-        "function_call_output" => ("tool".to_string(), string(payload.get("call_id"))),
+        "function_call" => ("tool_call".to_string(), function_call_content(payload)),
+        "custom_tool_call" => ("tool_call".to_string(), custom_tool_call_content(payload)),
+        "function_call_output" | "custom_tool_call_output" => {
+            ("tool".to_string(), tool_output_content(payload))
+        }
+        "reasoning" => (
+            "assistant".to_string(),
+            summary_text(payload.get("summary"))
+                .or_else_empty(string(payload.get("text")))
+                .or_else_empty(content_text(payload.get("content"))),
+        ),
         _ => (
             string(payload.get("role")),
             content_text(payload.get("content")),
@@ -609,6 +739,55 @@ fn message_from_response_item(
         role,
         content,
     }
+}
+
+fn function_call_content(payload: &Map<String, Value>) -> String {
+    let name = string(payload.get("name")).or_else_empty("tool".to_string());
+    let arguments = string(payload.get("arguments"));
+    let detail = exec_command_from_arguments(&arguments)
+        .or_else(|| (!arguments.is_empty()).then(|| format_json_if_possible(&arguments)))
+        .unwrap_or_default();
+
+    if detail.is_empty() {
+        name
+    } else {
+        format!("{name}: {detail}")
+    }
+}
+
+fn custom_tool_call_content(payload: &Map<String, Value>) -> String {
+    let name = string(payload.get("name")).or_else_empty("tool".to_string());
+    let input = string(payload.get("input"));
+    if input.is_empty() {
+        name
+    } else {
+        format!("{name}: {input}")
+    }
+}
+
+fn tool_output_content(payload: &Map<String, Value>) -> String {
+    let output = match payload.get("output") {
+        Some(Value::String(value)) => format_json_if_possible(value),
+        Some(value) => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        None => String::new(),
+    };
+
+    output
+        .or_else_empty(string(payload.get("call_id")))
+        .or_else_empty("[empty output]".to_string())
+}
+
+fn exec_command_from_arguments(arguments: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let object = value.as_object()?;
+    string(object.get("cmd")).then_non_empty()
+}
+
+fn format_json_if_possible(value: &str) -> String {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn message_from_raw_record(
