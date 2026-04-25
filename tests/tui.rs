@@ -1,6 +1,4 @@
-use codex_compaction_viewer::tui::{
-    build_tui_model, handle_key, handle_mouse, TuiDisplayMode, TuiFocus, TuiState,
-};
+use codex_compaction_viewer::tui::{build_tui_model, handle_key, handle_mouse, TuiFocus, TuiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -383,25 +381,24 @@ fn tui_defaults_to_tidy_history_and_toggles_verbose_mode() {
 }
 
 #[test]
-fn tui_raw_body_popup_is_flag_gated_and_scrollable() {
+fn tui_r_key_opens_raw_body_popup_by_default() {
     let tmp = TempDir::new().expect("tempdir");
     write_raw_body_session(&tmp.path().join("sessions/2026/04/25/rollout-raw.jsonl"));
 
     let model = build_tui_model(Some(tmp.path()), false, None).expect("build model");
-    let mut disabled = TuiState::new(model.clone());
-    handle_key(&mut disabled, key(KeyCode::Char('r')));
-    assert!(!disabled.raw_popup_visible());
+    let mut state = TuiState::new(model);
 
-    let mut enabled = TuiState::with_options(model, TuiDisplayMode::Tidy, true);
-    handle_key(&mut enabled, key(KeyCode::Char('r')));
-    assert!(enabled.raw_popup_visible());
-    assert!(enabled.raw_popup_text().contains("REQUEST BODY"));
-    assert!(enabled.raw_popup_text().contains("cargo test --test tui"));
+    assert!(state.footer_help_text().contains("r raw"));
 
-    handle_key(&mut enabled, key(KeyCode::Down));
-    assert_eq!(enabled.raw_popup_scroll(), 1);
-    handle_key(&mut enabled, key(KeyCode::Esc));
-    assert!(!enabled.raw_popup_visible());
+    handle_key(&mut state, key(KeyCode::Char('r')));
+    assert!(state.raw_popup_visible());
+    assert!(state.raw_popup_text().contains("REQUEST BODY"));
+    assert!(state.raw_popup_text().contains("cargo test --test tui"));
+
+    handle_key(&mut state, key(KeyCode::Down));
+    assert_eq!(state.raw_popup_scroll(), 1);
+    handle_key(&mut state, key(KeyCode::Esc));
+    assert!(!state.raw_popup_visible());
 }
 
 #[test]

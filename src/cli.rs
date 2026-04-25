@@ -44,7 +44,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = DisplayModeArg::Tidy)]
     pub mode: DisplayModeArg,
 
-    /// Enable raw request/response body popups in the TUI.
+    /// Open the raw request/response body popup when the TUI starts.
     #[arg(long)]
     pub raw_bodies: bool,
 

@@ -59,7 +59,7 @@ Open the interactive viewer with the full event history:
 cxv --tui --mode verbose ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 ```
 
-Open raw request/response bodies in the interactive viewer:
+Open the interactive viewer with the raw body popup already visible:
 
 ```bash
 cxv --tui --raw-bodies ~/.codex/sessions/2026/04/25/rollout-example.jsonl
@@ -106,7 +106,7 @@ The TUI shows:
 - History table: tidy by default, showing only user messages, compactions, assistant responses, tool-call requests, and tool-call responses. Verbose mode shows every parsed event row. Compaction rows are marked by `*`.
 - Detail panel: full selected message metadata/content, or all compaction summaries.
 - Session search: `/` filters the left sidebar by project/cwd/session text. Search terms can be scoped with `project:`, `cwd:`, `session:`, or `id:`; `tag:compaction` and `has:compaction` show only sessions with compaction events.
-- Raw body popup: when launched with `--raw-bodies`, `r` opens the selected row's raw tool-call request body, tool response body, and source payload.
+- Raw body popup: `r` opens the selected row's raw tool-call request body, tool response body, and source payload.
 
 Keybindings:
 
@@ -118,7 +118,7 @@ Keybindings:
 | `/` | Edit session search text |
 | `g` | Toggle sessions with compaction events only |
 | `v` | Toggle tidy / verbose history mode |
-| `r` | Open/close raw request/response body popup when `--raw-bodies` is enabled |
+| `r` | Open/close raw request/response body popup |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
 | `Esc` | Return from search/detail focus; quit from history focus |

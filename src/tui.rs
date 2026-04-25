@@ -85,7 +85,6 @@ pub struct TuiState {
     pub selected_message: usize,
     pub show_summaries: bool,
     pub display_mode: TuiDisplayMode,
-    raw_bodies_enabled: bool,
     show_raw_popup: bool,
     session_search: String,
     filter_compacted_sessions: bool,
@@ -200,8 +199,7 @@ impl TuiState {
             model,
             show_summaries: false,
             display_mode,
-            raw_bodies_enabled,
-            show_raw_popup: false,
+            show_raw_popup: raw_bodies_enabled,
             session_search: String::new(),
             filter_compacted_sessions: false,
             focus: TuiFocus::History,
@@ -262,6 +260,23 @@ impl TuiState {
         self.display_mode
     }
 
+    pub fn footer_help_text(&self) -> String {
+        let compacted_filter = if self.filter_compacted_sessions {
+            "compacted:on"
+        } else {
+            "compacted:off"
+        };
+        let focus = match self.focus {
+            TuiFocus::History => "history",
+            TuiFocus::Detail => "detail",
+            TuiFocus::SessionSearch => "search",
+        };
+        format!(
+            "q quit | / search | r raw | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
+            self.display_mode.as_str()
+        )
+    }
+
     pub fn selected_message_line(&self) -> Option<usize> {
         self.visible_messages()
             .get(self.selected_message)
@@ -269,10 +284,6 @@ impl TuiState {
     }
 
     pub fn raw_popup_text(&self) -> String {
-        if !self.raw_bodies_enabled {
-            return "Raw request/response bodies are disabled.".to_string();
-        }
-
         let Some(message) = self.visible_messages().get(self.selected_message).copied() else {
             return "No message selected.".to_string();
         };
@@ -578,9 +589,6 @@ impl TuiState {
     }
 
     fn toggle_raw_popup(&mut self) {
-        if !self.raw_bodies_enabled {
-            return;
-        }
         self.show_raw_popup = !self.show_raw_popup;
         self.raw_popup_scroll = 0;
     }
@@ -886,27 +894,8 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let compacted_filter = if state.filter_compacted_sessions {
-        "compacted:on"
-    } else {
-        "compacted:off"
-    };
-    let focus = match state.focus {
-        TuiFocus::History => "history",
-        TuiFocus::Detail => "detail",
-        TuiFocus::SessionSearch => "search",
-    };
-    let raw_hint = if state.raw_bodies_enabled {
-        " | r raw"
-    } else {
-        ""
-    };
-    let text = format!(
-        "q quit | / search | g {compacted_filter} | v mode:{}{raw_hint} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
-        state.display_mode.as_str()
-    );
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(state.footer_help_text()).style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }
