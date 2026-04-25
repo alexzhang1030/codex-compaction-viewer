@@ -45,6 +45,23 @@ fn cxv() -> Command {
 }
 
 #[test]
+fn version_flags_print_package_version() {
+    for flag in ["--version", "-v"] {
+        let output = cxv().arg(flag).output().expect("run cxv");
+
+        assert!(
+            output.status.success(),
+            "{flag} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("cxv {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
+
+#[test]
 fn scan_json_outputs_structured_session_rows() {
     let tmp = TempDir::new().expect("tempdir");
     let session = tmp.path().join("sessions/2026/04/25/rollout-cli.jsonl");

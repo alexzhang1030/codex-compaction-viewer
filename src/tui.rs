@@ -56,8 +56,9 @@ pub enum TuiFocus {
     SessionSearch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TuiDisplayMode {
+    #[default]
     Tidy,
     Verbose,
 }
@@ -75,12 +76,6 @@ impl TuiDisplayMode {
             Self::Tidy => Self::Verbose,
             Self::Verbose => Self::Tidy,
         }
-    }
-}
-
-impl Default for TuiDisplayMode {
-    fn default() -> Self {
-        Self::Tidy
     }
 }
 
@@ -877,7 +872,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn draw_title(frame: &mut Frame<'_>, area: Rect) {
-    let title = Paragraph::new("cxv - Codex Compaction Viewer").style(
+    let title = Paragraph::new(format!(
+        "{} {} - Codex Compaction Viewer",
+        crate::APP_NAME,
+        crate::APP_VERSION
+    ))
+    .style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -1346,4 +1346,34 @@ fn format_json_if_possible(value: &str) -> String {
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn title_bar_includes_package_version() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let state = TuiState::new(TuiModel {
+            sessions: Vec::new(),
+            selected_session: 0,
+        });
+
+        terminal.draw(|frame| draw(frame, &state)).expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains(&format!("cxv {}", env!("CARGO_PKG_VERSION"))),
+            "rendered buffer did not include package version: {rendered:?}"
+        );
+    }
 }

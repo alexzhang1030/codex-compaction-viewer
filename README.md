@@ -40,6 +40,13 @@ Launch the interactive terminal viewer:
 cxv
 ```
 
+Show the installed version:
+
+```bash
+cxv --version
+cxv -v
+```
+
 Open the interactive viewer for one session:
 
 ```bash
@@ -92,6 +99,7 @@ cxv ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 
 The TUI shows:
 
+- Title bar: package version and application name.
 - Left sidebar: discovered Codex session files, newest first.
 - Stats panel: message count, line count, compactions, token totals, context window, source path.
 - Compaction panel: highlighted compaction events and summary sizes.

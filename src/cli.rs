@@ -1,7 +1,7 @@
 use crate::parser::{discover_sessions, parse_jsonl, CompactionEvent, ParsedSession};
 use crate::tui::TuiDisplayMode;
 use anyhow::Result;
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -47,6 +47,10 @@ pub struct Args {
     /// Enable raw request/response body popups in the TUI.
     #[arg(long)]
     pub raw_bodies: bool,
+
+    /// Print version information.
+    #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
+    pub version: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -146,7 +150,8 @@ pub fn main_entry() -> i32 {
 }
 
 fn should_launch_tui(args: &Args, arg_count: usize) -> bool {
-    (args.tui || arg_count == 1)
+    !args.version
+        && (args.tui || arg_count == 1)
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
 }
@@ -161,6 +166,10 @@ where
 }
 
 pub fn run(args: Args) -> Result<String> {
+    if args.version {
+        return Ok(crate::version_line());
+    }
+
     if args.tui {
         return Ok(
             "Interactive TUI requires a terminal. Run `cxv --tui` from a TTY.\n".to_string(),
