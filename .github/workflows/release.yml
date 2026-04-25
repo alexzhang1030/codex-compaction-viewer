@@ -18,23 +18,37 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: cxv-linux-x86_64.tar.gz
-          - os: macos-13
+            rust_target: ""
+            build_args: ""
+            bin_path: target/release/cxv
+          - os: macos-14
             asset: cxv-macos-x86_64.tar.gz
+            rust_target: x86_64-apple-darwin
+            build_args: "--target x86_64-apple-darwin"
+            bin_path: target/x86_64-apple-darwin/release/cxv
           - os: macos-14
             asset: cxv-macos-aarch64.tar.gz
+            rust_target: ""
+            build_args: ""
+            bin_path: target/release/cxv
           - os: windows-latest
             asset: cxv-windows-x86_64.zip
+            rust_target: ""
+            build_args: ""
 
     steps:
       - uses: actions/checkout@v4
       - run: cargo test
-      - run: cargo build --release
+      - name: Add cross target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
+      - run: cargo build --release ${{ matrix.build_args }}
       - name: Package Unix binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/${{ matrix.asset }}" -C target/release cxv
+          tar -czf "dist/${{ matrix.asset }}" -C "$(dirname "${{ matrix.bin_path }}")" "$(basename "${{ matrix.bin_path }}")"
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
