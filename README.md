@@ -52,6 +52,12 @@ Open the interactive viewer with the full event history:
 cxv --tui --mode verbose ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 ```
 
+Open raw request/response bodies in the interactive viewer:
+
+```bash
+cxv --tui --raw-bodies ~/.codex/sessions/2026/04/25/rollout-example.jsonl
+```
+
 Scan active Codex sessions:
 
 ```bash
@@ -92,6 +98,7 @@ The TUI shows:
 - History table: tidy by default, showing only user messages, compactions, assistant responses, tool-call requests, and tool-call responses. Verbose mode shows every parsed event row. Compaction rows are marked by `*`.
 - Detail panel: full selected message metadata/content, or all compaction summaries.
 - Session search: `/` filters the left sidebar by project/cwd/session text. Search terms can be scoped with `project:`, `cwd:`, `session:`, or `id:`; `tag:compaction` and `has:compaction` show only sessions with compaction events.
+- Raw body popup: when launched with `--raw-bodies`, `r` opens the selected row's raw tool-call request body, tool response body, and source payload.
 
 Keybindings:
 
@@ -103,15 +110,26 @@ Keybindings:
 | `/` | Edit session search text |
 | `g` | Toggle sessions with compaction events only |
 | `v` | Toggle tidy / verbose history mode |
+| `r` | Open/close raw request/response body popup when `--raw-bodies` is enabled |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
 | `Esc` | Return from search/detail focus; quit from history focus |
 | `q` | Quit |
 
+Mouse support:
+
+| Mouse | Action |
+| --- | --- |
+| Left click session | Select session |
+| Left click history row | Select history row |
+| Left click detail | Focus detail |
+| Wheel | Move history/session selection, or scroll detail/raw popup |
+| Right click raw popup | Close popup |
+
 ## Data Model
 
 - `SessionMetadata`: source file, session id, cwd, CLI version, provider.
-- `ParsedMessage`: normalized event/message rows from `event_msg`, `response_item`, `turn_context`, raw role records, and other records.
+- `ParsedMessage`: normalized event/message rows from `event_msg`, `response_item`, `turn_context`, raw role records, and other records. Tool-call rows also retain raw request/response bodies for opt-in TUI inspection.
 - `CompactionEvent`: compact summary with line, optional boundary line, source type, trigger, summary text, truncation policy, and token usage.
 - `ConversationStats`: line counts, bad JSON count, token totals, model context window, and time bounds.
 

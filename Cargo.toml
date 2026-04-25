@@ -1,6 +1,6 @@
 [package]
 name = "codex-compaction-viewer"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Inspect Codex JSONL sessions for context summaries, token usage, and truncation signals."
 license = "MIT"

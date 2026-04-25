@@ -40,6 +40,50 @@ pub struct ParsedMessage {
     pub kind: String,
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_body: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub response_body: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw_payload: String,
+}
+
+impl ParsedMessage {
+    fn new(
+        line_number: usize,
+        timestamp: &str,
+        record_type: impl Into<String>,
+        kind: impl Into<String>,
+        role: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            line_number,
+            timestamp: timestamp.to_string(),
+            record_type: record_type.into(),
+            kind: kind.into(),
+            role: role.into(),
+            content: content.into(),
+            request_body: String::new(),
+            response_body: String::new(),
+            raw_payload: String::new(),
+        }
+    }
+
+    fn with_raw_payload(mut self, payload: &Map<String, Value>) -> Self {
+        self.raw_payload = format_object_json(payload);
+        self
+    }
+
+    fn with_request_body(mut self, body: String) -> Self {
+        self.request_body = body;
+        self
+    }
+
+    fn with_response_body(mut self, body: String) -> Self {
+        self.response_body = body;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -275,26 +319,29 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
                         .push(message_from_raw_record(line_number, &timestamp, &record));
                 } else {
                     pending_boundary = None;
-                    parsed.messages.push(ParsedMessage {
+                    parsed.messages.push(ParsedMessage::new(
                         line_number,
-                        timestamp,
-                        record_type: record_type.clone(),
-                        kind: record_type,
-                        role: String::new(),
-                        content: String::new(),
-                    });
+                        &timestamp,
+                        record_type.clone(),
+                        record_type,
+                        "",
+                        "",
+                    ));
                 }
             }
             _ => {
                 pending_boundary = None;
-                parsed.messages.push(ParsedMessage {
-                    line_number,
-                    timestamp,
-                    record_type,
-                    kind: string(payload.get("type")),
-                    role: String::new(),
-                    content: String::new(),
-                });
+                parsed.messages.push(
+                    ParsedMessage::new(
+                        line_number,
+                        &timestamp,
+                        record_type,
+                        string(payload.get("type")),
+                        "",
+                        "",
+                    )
+                    .with_raw_payload(payload),
+                );
             }
         }
     }
@@ -637,14 +684,15 @@ fn message_from_turn_context(
         })
         .unwrap_or_default();
 
-    ParsedMessage {
+    ParsedMessage::new(
         line_number,
-        timestamp: timestamp.to_string(),
-        record_type: "turn_context".to_string(),
-        kind: "turn_context".to_string(),
-        role: "system".to_string(),
-        content: policy_text,
-    }
+        timestamp,
+        "turn_context",
+        "turn_context",
+        "system",
+        policy_text,
+    )
+    .with_raw_payload(payload)
 }
 
 fn message_from_event(
@@ -697,14 +745,8 @@ fn message_from_event(
         ),
     };
 
-    ParsedMessage {
-        line_number,
-        timestamp: timestamp.to_string(),
-        record_type: "event_msg".to_string(),
-        kind,
-        role,
-        content,
-    }
+    ParsedMessage::new(line_number, timestamp, "event_msg", kind, role, content)
+        .with_raw_payload(payload)
 }
 
 fn message_from_response_item(
@@ -713,32 +755,45 @@ fn message_from_response_item(
     payload: &Map<String, Value>,
 ) -> ParsedMessage {
     let kind = string(payload.get("type"));
-    let (role, content) = match kind.as_str() {
-        "function_call" => ("tool_call".to_string(), function_call_content(payload)),
-        "custom_tool_call" => ("tool_call".to_string(), custom_tool_call_content(payload)),
-        "function_call_output" | "custom_tool_call_output" => {
-            ("tool".to_string(), tool_output_content(payload))
-        }
+    let (role, content, request_body, response_body) = match kind.as_str() {
+        "function_call" => (
+            "tool_call".to_string(),
+            function_call_content(payload),
+            string(payload.get("arguments")),
+            String::new(),
+        ),
+        "custom_tool_call" => (
+            "tool_call".to_string(),
+            custom_tool_call_content(payload),
+            string(payload.get("input")),
+            String::new(),
+        ),
+        "function_call_output" | "custom_tool_call_output" => (
+            "tool".to_string(),
+            tool_output_content(payload),
+            String::new(),
+            raw_output_body(payload),
+        ),
         "reasoning" => (
             "assistant".to_string(),
             summary_text(payload.get("summary"))
                 .or_else_empty(string(payload.get("text")))
                 .or_else_empty(content_text(payload.get("content"))),
+            String::new(),
+            String::new(),
         ),
         _ => (
             string(payload.get("role")),
             content_text(payload.get("content")),
+            String::new(),
+            String::new(),
         ),
     };
 
-    ParsedMessage {
-        line_number,
-        timestamp: timestamp.to_string(),
-        record_type: "response_item".to_string(),
-        kind,
-        role,
-        content,
-    }
+    ParsedMessage::new(line_number, timestamp, "response_item", kind, role, content)
+        .with_request_body(request_body)
+        .with_response_body(response_body)
+        .with_raw_payload(payload)
 }
 
 fn function_call_content(payload: &Map<String, Value>) -> String {
@@ -777,6 +832,14 @@ fn tool_output_content(payload: &Map<String, Value>) -> String {
         .or_else_empty("[empty output]".to_string())
 }
 
+fn raw_output_body(payload: &Map<String, Value>) -> String {
+    match payload.get("output") {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        None => String::new(),
+    }
+}
+
 fn exec_command_from_arguments(arguments: &str) -> Option<String> {
     let value: Value = serde_json::from_str(arguments).ok()?;
     let object = value.as_object()?;
@@ -788,6 +851,10 @@ fn format_json_if_possible(value: &str) -> String {
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| value.to_string())
+}
+
+fn format_object_json(value: &Map<String, Value>) -> String {
+    serde_json::to_string_pretty(&Value::Object(value.clone())).unwrap_or_default()
 }
 
 fn message_from_raw_record(
@@ -808,14 +875,15 @@ fn message_from_raw_record(
         content = format!("compact boundary {trigger}").trim().to_string();
     }
 
-    ParsedMessage {
+    ParsedMessage::new(
         line_number,
-        timestamp: timestamp.to_string(),
-        record_type: record_type.clone(),
-        kind: subtype.or_else_empty(record_type.clone()),
-        role: record_type,
+        timestamp,
+        record_type.clone(),
+        subtype.or_else_empty(record_type.clone()),
+        record_type,
         content,
-    }
+    )
+    .with_raw_payload(record)
 }
 
 fn message_from_compacted(
@@ -826,16 +894,15 @@ fn message_from_compacted(
     let replacement_history_len = replacement_history_len(payload);
     let summary_length = summary_text(payload.get("message")).chars().count();
 
-    ParsedMessage {
+    ParsedMessage::new(
         line_number,
-        timestamp: timestamp.to_string(),
-        record_type: "compacted".to_string(),
-        kind: "compacted".to_string(),
-        role: "system".to_string(),
-        content: format!(
-            "replacement_history={replacement_history_len} summary_chars={summary_length}"
-        ),
-    }
+        timestamp,
+        "compacted",
+        "compacted",
+        "system",
+        format!("replacement_history={replacement_history_len} summary_chars={summary_length}"),
+    )
+    .with_raw_payload(payload)
 }
 
 fn apply_token_count(

@@ -43,6 +43,10 @@ pub struct Args {
     /// TUI history display mode.
     #[arg(long, value_enum, default_value_t = DisplayModeArg::Tidy)]
     pub mode: DisplayModeArg,
+
+    /// Enable raw request/response body popups in the TUI.
+    #[arg(long)]
+    pub raw_bodies: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -119,6 +123,7 @@ pub fn main_entry() -> i32 {
             args.include_archived,
             args.file.as_deref(),
             args.mode.into(),
+            args.raw_bodies,
         ) {
             Ok(()) => 0,
             Err(error) => {

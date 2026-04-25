@@ -1,5 +1,8 @@
-use codex_compaction_viewer::tui::{build_tui_model, handle_key, TuiFocus, TuiState};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use codex_compaction_viewer::tui::{
+    build_tui_model, handle_key, handle_mouse, TuiDisplayMode, TuiFocus, TuiState,
+};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use serde_json::json;
 use std::fs;
 use std::io::Write;
@@ -156,8 +159,51 @@ fn write_mixed_session(path: &Path) {
     }
 }
 
+fn write_raw_body_session(path: &Path) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("create session dir");
+    let rows = vec![
+        json!({
+            "timestamp": "2026-04-25T12:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "raw-session", "cwd": "/repo/raw"}
+        }),
+        json!({
+            "timestamp": "2026-04-25T12:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call-raw",
+                "arguments": "{\"cmd\":\"cargo test --test tui\"}"
+            }
+        }),
+        json!({
+            "timestamp": "2026-04-25T12:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-raw",
+                "output": "{\"exit_code\":0,\"stdout\":\"tui ok\"}"
+            }
+        }),
+    ];
+    let mut file = fs::File::create(path).expect("create fixture");
+    for row in rows {
+        writeln!(file, "{row}").expect("write row");
+    }
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
 }
 
 fn visible_history_lines(state: &mut TuiState) -> Vec<usize> {
@@ -334,6 +380,57 @@ fn tui_defaults_to_tidy_history_and_toggles_verbose_mode() {
         visible_history_lines(&mut state),
         vec![2, 3, 4, 5, 6, 7, 8, 9, 10]
     );
+}
+
+#[test]
+fn tui_raw_body_popup_is_flag_gated_and_scrollable() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_raw_body_session(&tmp.path().join("sessions/2026/04/25/rollout-raw.jsonl"));
+
+    let model = build_tui_model(Some(tmp.path()), false, None).expect("build model");
+    let mut disabled = TuiState::new(model.clone());
+    handle_key(&mut disabled, key(KeyCode::Char('r')));
+    assert!(!disabled.raw_popup_visible());
+
+    let mut enabled = TuiState::with_options(model, TuiDisplayMode::Tidy, true);
+    handle_key(&mut enabled, key(KeyCode::Char('r')));
+    assert!(enabled.raw_popup_visible());
+    assert!(enabled.raw_popup_text().contains("REQUEST BODY"));
+    assert!(enabled.raw_popup_text().contains("cargo test --test tui"));
+
+    handle_key(&mut enabled, key(KeyCode::Down));
+    assert_eq!(enabled.raw_popup_scroll(), 1);
+    handle_key(&mut enabled, key(KeyCode::Esc));
+    assert!(!enabled.raw_popup_visible());
+}
+
+#[test]
+fn tui_mouse_clicks_select_history_and_wheel_scrolls_detail() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_mixed_session(&tmp.path().join("sessions/2026/04/25/rollout-mixed.jsonl"));
+
+    let model = build_tui_model(Some(tmp.path()), false, None).expect("build model");
+    let mut state = TuiState::new(model);
+    let area = Rect::new(0, 0, 120, 40);
+
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 42, 13),
+        area,
+    );
+
+    assert_eq!(state.focus(), TuiFocus::History);
+    assert_eq!(state.selected_message_line(), Some(6));
+
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 42, 25),
+        area,
+    );
+    assert_eq!(state.focus(), TuiFocus::Detail);
+
+    handle_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 42, 25), area);
+    assert_eq!(state.detail_scroll(), 3);
 }
 
 #[test]

@@ -3,7 +3,10 @@ use crate::parser::{
 };
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,7 +16,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Wrap,
     },
     Frame, Terminal,
 };
@@ -86,10 +90,23 @@ pub struct TuiState {
     pub selected_message: usize,
     pub show_summaries: bool,
     pub display_mode: TuiDisplayMode,
+    raw_bodies_enabled: bool,
+    show_raw_popup: bool,
     session_search: String,
     filter_compacted_sessions: bool,
     focus: TuiFocus,
     detail_scroll: u16,
+    raw_popup_scroll: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TuiLayout {
+    title: Rect,
+    sessions: Rect,
+    history: Rect,
+    detail: Rect,
+    footer: Rect,
+    popup: Rect,
 }
 
 pub fn build_tui_model(
@@ -145,20 +162,25 @@ pub fn launch(
     include_archived: bool,
     initial_file: Option<&Path>,
     display_mode: TuiDisplayMode,
+    raw_bodies_enabled: bool,
 ) -> Result<()> {
     let model = build_tui_model(root, include_archived, initial_file)?;
-    let mut state = TuiState::with_display_mode(model, display_mode);
+    let mut state = TuiState::with_options(model, display_mode, raw_bodies_enabled);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_terminal(&mut terminal, &mut state);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -170,15 +192,26 @@ impl TuiState {
     }
 
     pub fn with_display_mode(model: TuiModel, display_mode: TuiDisplayMode) -> Self {
+        Self::with_options(model, display_mode, false)
+    }
+
+    pub fn with_options(
+        model: TuiModel,
+        display_mode: TuiDisplayMode,
+        raw_bodies_enabled: bool,
+    ) -> Self {
         Self {
             selected_message: 0,
             model,
             show_summaries: false,
             display_mode,
+            raw_bodies_enabled,
+            show_raw_popup: false,
             session_search: String::new(),
             filter_compacted_sessions: false,
             focus: TuiFocus::History,
             detail_scroll: 0,
+            raw_popup_scroll: 0,
         }
     }
 
@@ -222,6 +255,14 @@ impl TuiState {
         self.detail_scroll
     }
 
+    pub fn raw_popup_visible(&self) -> bool {
+        self.show_raw_popup
+    }
+
+    pub fn raw_popup_scroll(&self) -> u16 {
+        self.raw_popup_scroll
+    }
+
     pub fn display_mode(&self) -> TuiDisplayMode {
         self.display_mode
     }
@@ -230,6 +271,57 @@ impl TuiState {
         self.visible_messages()
             .get(self.selected_message)
             .map(|message| message.line_number)
+    }
+
+    pub fn raw_popup_text(&self) -> String {
+        if !self.raw_bodies_enabled {
+            return "Raw request/response bodies are disabled.".to_string();
+        }
+
+        let Some(message) = self.visible_messages().get(self.selected_message).copied() else {
+            return "No message selected.".to_string();
+        };
+
+        let mut output = String::new();
+        output.push_str(&format!(
+            "{} line {}\n",
+            display_kind(message),
+            message.line_number
+        ));
+        if !message.timestamp.is_empty() {
+            output.push_str(&format!("time: {}\n", message.timestamp));
+        }
+        if !message.role.is_empty() {
+            output.push_str(&format!("role: {}\n", message.role));
+        }
+
+        if !message.request_body.is_empty() {
+            output.push_str("\nREQUEST BODY\n");
+            output.push_str(&format_json_if_possible(&message.request_body));
+            output.push('\n');
+        }
+        if !message.response_body.is_empty() {
+            output.push_str("\nRESPONSE BODY\n");
+            output.push_str(&format_json_if_possible(&message.response_body));
+            output.push('\n');
+        }
+        if !message.raw_payload.is_empty() {
+            output.push_str("\nRAW PAYLOAD\n");
+            output.push_str(&message.raw_payload);
+            output.push('\n');
+        }
+        if output.lines().count() <= 4 {
+            output.push_str("\nNo raw request/response body is available for this row.");
+        }
+
+        if output.chars().count() > 40_000 {
+            format!(
+                "{}...\n\n(truncated)",
+                output.chars().take(40_000).collect::<String>()
+            )
+        } else {
+            output
+        }
     }
 
     pub fn compaction_summary_text(&self) -> String {
@@ -480,6 +572,29 @@ impl TuiState {
         }
     }
 
+    fn scroll_raw_popup(&mut self, delta: isize) {
+        if delta.is_negative() {
+            self.raw_popup_scroll = self
+                .raw_popup_scroll
+                .saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            self.raw_popup_scroll = self.raw_popup_scroll.saturating_add(delta as u16);
+        }
+    }
+
+    fn toggle_raw_popup(&mut self) {
+        if !self.raw_bodies_enabled {
+            return;
+        }
+        self.show_raw_popup = !self.show_raw_popup;
+        self.raw_popup_scroll = 0;
+    }
+
+    fn close_raw_popup(&mut self) {
+        self.show_raw_popup = false;
+        self.raw_popup_scroll = 0;
+    }
+
     fn move_session(&mut self, delta: isize) {
         let indices = self.visible_session_indices();
         if indices.is_empty() {
@@ -496,7 +611,9 @@ impl TuiState {
         self.model.selected_session = indices[next_position];
         self.selected_message = 0;
         self.show_summaries = false;
+        self.show_raw_popup = false;
         self.detail_scroll = 0;
+        self.raw_popup_scroll = 0;
     }
 
     fn toggle_compaction_session_filter(&mut self) {
@@ -533,16 +650,36 @@ fn run_terminal(
         terminal.draw(|frame| draw(frame, state))?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(state, key) {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key(state, key) {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    handle_mouse(state, mouse, area);
+                }
+                _ => {}
             }
         }
     }
 }
 
 pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if state.show_raw_popup {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => state.close_raw_popup(),
+            KeyCode::Char('j') | KeyCode::Down => state.scroll_raw_popup(1),
+            KeyCode::Char('k') | KeyCode::Up => state.scroll_raw_popup(-1),
+            KeyCode::PageDown => state.scroll_raw_popup(10),
+            KeyCode::PageUp => state.scroll_raw_popup(-10),
+            _ => {}
+        }
+        return false;
+    }
+
     if state.focus == TuiFocus::SessionSearch {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => state.focus = TuiFocus::History,
@@ -600,12 +737,73 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.detail_scroll = 0;
         }
         KeyCode::Char('v') => state.toggle_display_mode(),
+        KeyCode::Char('r') => state.toggle_raw_popup(),
         _ => {}
     }
     false
 }
 
+pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
+    let layout = tui_layout(area);
+    if state.show_raw_popup {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => state.scroll_raw_popup(3),
+            MouseEventKind::ScrollUp => state.scroll_raw_popup(-3),
+            MouseEventKind::Down(MouseButton::Right) => state.close_raw_popup(),
+            _ => {}
+        }
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if contains(layout.sessions, mouse.column, mouse.row) {
+                select_session_at(state, layout.sessions, mouse.row);
+                state.focus = TuiFocus::History;
+            } else if contains(layout.history, mouse.column, mouse.row) {
+                select_message_at(state, layout.history, mouse.row);
+                state.focus = TuiFocus::History;
+            } else if contains(layout.detail, mouse.column, mouse.row) {
+                state.focus = TuiFocus::Detail;
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if contains(layout.detail, mouse.column, mouse.row) || state.focus == TuiFocus::Detail {
+                state.focus = TuiFocus::Detail;
+                state.scroll_detail(3);
+            } else if contains(layout.sessions, mouse.column, mouse.row) {
+                state.move_session(1);
+            } else {
+                state.move_message(3);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if contains(layout.detail, mouse.column, mouse.row) || state.focus == TuiFocus::Detail {
+                state.focus = TuiFocus::Detail;
+                state.scroll_detail(-3);
+            } else if contains(layout.sessions, mouse.column, mouse.row) {
+                state.move_session(-1);
+            } else {
+                state.move_message(-3);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn draw(frame: &mut Frame<'_>, state: &TuiState) {
+    let layout = tui_layout(frame.area());
+
+    draw_title(frame, layout.title);
+    draw_footer(frame, layout.footer, state);
+    draw_sessions(frame, layout.sessions, state);
+    draw_session_content(frame, right_content_area(frame.area()), state);
+    if state.show_raw_popup {
+        draw_raw_popup(frame, layout.popup, state);
+    }
+}
+
+fn tui_layout(area: Rect) -> TuiLayout {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -613,18 +811,69 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(frame.area());
-
-    draw_title(frame, root[0]);
-    draw_footer(frame, root[2], state);
+        .split(area);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(38), Constraint::Min(40)])
         .split(root[1]);
 
-    draw_sessions(frame, body[0], state);
-    draw_session_content(frame, body[1], state);
+    let content = session_content_layout(body[1]);
+
+    TuiLayout {
+        title: root[0],
+        sessions: body[0],
+        history: content[2],
+        detail: content[3],
+        footer: root[2],
+        popup: centered_rect(82, 76, area),
+    }
+}
+
+fn right_content_area(area: Rect) -> Rect {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(38), Constraint::Min(40)])
+        .split(root[1])[1]
+}
+
+fn session_content_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Percentage(46),
+            Constraint::Percentage(54),
+        ])
+        .split(area)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn draw_title(frame: &mut Frame<'_>, area: Rect) {
@@ -647,8 +896,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         TuiFocus::Detail => "detail",
         TuiFocus::SessionSearch => "search",
     };
+    let raw_hint = if state.raw_bodies_enabled {
+        " | r raw"
+    } else {
+        ""
+    };
     let text = format!(
-        "q quit | / search | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
+        "q quit | / search | g {compacted_filter} | v mode:{}{raw_hint} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
         state.display_mode.as_str()
     );
     frame.render_widget(
@@ -727,15 +981,7 @@ fn draw_session_content(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Percentage(46),
-            Constraint::Percentage(54),
-        ])
-        .split(area);
+    let chunks = session_content_layout(area);
 
     draw_stats(frame, chunks[0], session);
     draw_compactions(frame, chunks[1], session);
@@ -875,6 +1121,15 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_raw_popup(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    frame.render_widget(Clear, area);
+    let paragraph = Paragraph::new(state.raw_popup_text())
+        .block(focused_block("Raw Body  Esc/q close".to_string(), true))
+        .scroll((state.raw_popup_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn session_row(parsed: ParsedSession) -> TuiSession {
     let stats = &parsed.stats;
     let metadata = &parsed.metadata;
@@ -932,6 +1187,42 @@ fn sessions_title(state: &TuiState) -> String {
         parts.push("tag:compaction".to_string());
     }
     parts.join(" ")
+}
+
+fn select_session_at(state: &mut TuiState, area: Rect, row: u16) {
+    let visible_indices = state.visible_session_indices();
+    if visible_indices.is_empty() {
+        return;
+    }
+    let row = row.saturating_sub(area.y + 1) as usize;
+    let index = row / 2;
+    if let Some(session_index) = visible_indices.get(index).copied() {
+        state.model.selected_session = session_index;
+        state.selected_message = 0;
+        state.show_summaries = false;
+        state.detail_scroll = 0;
+    }
+}
+
+fn select_message_at(state: &mut TuiState, area: Rect, row: u16) {
+    let count = state.visible_messages().len();
+    if count == 0 {
+        state.selected_message = 0;
+        return;
+    }
+    let index = row.saturating_sub(area.y + 2) as usize;
+    if index < count {
+        state.selected_message = index;
+        state.show_summaries = false;
+        state.detail_scroll = 0;
+    }
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn session_matches_term(session: &TuiSession, term: &str) -> bool {
@@ -1048,4 +1339,11 @@ fn empty_dash(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn format_json_if_possible(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| value.to_string())
 }

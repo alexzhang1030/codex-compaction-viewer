@@ -162,6 +162,62 @@ fn parse_jsonl_uses_tool_arguments_and_outputs_as_message_content() {
 }
 
 #[test]
+fn parse_jsonl_preserves_raw_request_and_response_bodies() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("raw-bodies.jsonl");
+    write_jsonl(
+        &session,
+        vec![
+            json!({
+                "timestamp": "2026-04-25T12:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call-raw",
+                    "arguments": "{\"cmd\":\"cargo test\",\"yield_time_ms\":1000}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-raw",
+                    "output": "{\"exit_code\":0,\"stdout\":\"ok\"}"
+                }
+            }),
+        ],
+    );
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+
+    let request = parsed
+        .messages
+        .iter()
+        .find(|message| message.kind == "function_call")
+        .expect("request message");
+    assert_eq!(
+        request.request_body,
+        "{\"cmd\":\"cargo test\",\"yield_time_ms\":1000}"
+    );
+    assert!(request.response_body.is_empty());
+    assert!(request.raw_payload.contains("\"arguments\""));
+
+    let response = parsed
+        .messages
+        .iter()
+        .find(|message| message.kind == "function_call_output")
+        .expect("response message");
+    assert_eq!(
+        response.response_body,
+        "{\"exit_code\":0,\"stdout\":\"ok\"}"
+    );
+    assert!(response.request_body.is_empty());
+    assert!(response.raw_payload.contains("\"output\""));
+}
+
+#[test]
 fn parse_jsonl_extracts_codex_context_summary_event() {
     let tmp = TempDir::new().expect("tempdir");
     let session = tmp.path().join("rollout-2026-04-25T12-00-00-example.jsonl");
