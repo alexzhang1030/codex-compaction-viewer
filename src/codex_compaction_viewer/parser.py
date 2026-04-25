@@ -48,6 +48,9 @@ class CompactionEvent:
     truncation_mode: str = ""
     truncation_limit: int | None = None
     token_usage: TokenUsage | None = None
+    source: str = "turn_context"
+    boundary_line_number: int | None = None
+    trigger: str = ""
 
     @property
     def summary_length(self) -> int:
@@ -78,6 +81,14 @@ class ParsedSession:
     stats: ConversationStats = field(default_factory=ConversationStats)
 
 
+@dataclass(slots=True)
+class PendingBoundary:
+    line_number: int
+    timestamp: str
+    trigger: str = ""
+    token_usage: TokenUsage | None = None
+
+
 def discover_sessions(root: Path | str | None = None, include_archived: bool = False) -> list[Path]:
     base = Path(root).expanduser() if root else Path.home() / ".codex"
     patterns = [base / "sessions"]
@@ -95,6 +106,7 @@ def parse_jsonl(path: Path | str) -> ParsedSession:
     session_path = Path(path).expanduser()
     parsed = ParsedSession(metadata=SessionMetadata(path=session_path))
     latest_token_usage: TokenUsage | None = None
+    pending_boundary: PendingBoundary | None = None
 
     with session_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -119,21 +131,38 @@ def parse_jsonl(path: Path | str) -> ParsedSession:
                 payload = {}
 
             if record_type == "session_meta":
+                pending_boundary = None
                 _apply_session_meta(parsed.metadata, payload, timestamp)
             elif record_type == "turn_context":
+                pending_boundary = None
                 event = _parse_turn_context(line_number, timestamp, payload, latest_token_usage)
                 if event:
                     parsed.compaction_events.append(event)
                 parsed.messages.append(_message_from_turn_context(line_number, timestamp, payload))
             elif record_type == "event_msg":
+                pending_boundary = None
                 message = _message_from_event(line_number, timestamp, payload)
                 parsed.messages.append(message)
                 if payload.get("type") == "token_count":
                     parsed.stats.token_count_events += 1
                     latest_token_usage = _apply_token_count(parsed.stats, payload)
             elif record_type == "response_item":
+                pending_boundary = None
                 parsed.messages.append(_message_from_response_item(line_number, timestamp, payload))
+            elif not payload and (boundary := _parse_raw_boundary(line_number, timestamp, record)):
+                pending_boundary = boundary
+                parsed.messages.append(_message_from_raw_record(line_number, timestamp, record))
+            elif not payload and _is_raw_compact_summary(record):
+                event = _parse_raw_compact_summary(line_number, timestamp, record, pending_boundary)
+                if event:
+                    parsed.compaction_events.append(event)
+                pending_boundary = None
+                parsed.messages.append(_message_from_raw_record(line_number, timestamp, record))
+            elif not payload and record_type in {"system", "user", "assistant"}:
+                pending_boundary = None
+                parsed.messages.append(_message_from_raw_record(line_number, timestamp, record))
             else:
+                pending_boundary = None
                 parsed.messages.append(
                     ParsedMessage(
                         line_number=line_number,
@@ -182,6 +211,73 @@ def _parse_turn_context(
         truncation_limit=_int_or_none(policy.get("limit")),
         token_usage=latest_token_usage,
     )
+
+
+def _parse_raw_boundary(
+    line_number: int,
+    timestamp: str,
+    record: dict[str, Any],
+) -> PendingBoundary | None:
+    if _string(record.get("type")) != "system" or _string(record.get("subtype")) != "compact_boundary":
+        return None
+
+    metadata = record.get("compactMetadata")
+    if not isinstance(metadata, dict):
+        metadata = record.get("compact_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    token_count = _first_int(
+        metadata,
+        (
+            "preCompactTokens",
+            "pre_compact_tokens",
+            "tokensBefore",
+            "tokens_before",
+            "totalTokens",
+            "total_tokens",
+        ),
+    )
+    token_usage = TokenUsage(total_tokens=token_count) if token_count is not None else None
+
+    return PendingBoundary(
+        line_number=line_number,
+        timestamp=timestamp,
+        trigger=_string(metadata.get("trigger")) or _string(record.get("trigger")),
+        token_usage=token_usage,
+    )
+
+
+def _parse_raw_compact_summary(
+    line_number: int,
+    timestamp: str,
+    record: dict[str, Any],
+    boundary: PendingBoundary | None,
+) -> CompactionEvent | None:
+    summary = (
+        _summary_text(record.get("summary"))
+        or _summary_text(record.get("compactSummary"))
+        or _summary_text(record.get("compact_summary"))
+        or _summary_text(_message_text(record.get("message")))
+        or _summary_text(record.get("content"))
+    )
+    if not summary:
+        return None
+
+    return CompactionEvent(
+        line_number=line_number,
+        timestamp=timestamp,
+        turn_id=_string(record.get("uuid")) or _string(record.get("id")),
+        summary=summary,
+        token_usage=boundary.token_usage if boundary else None,
+        source="boundary_summary" if boundary else "compact_summary",
+        boundary_line_number=boundary.line_number if boundary else None,
+        trigger=(boundary.trigger if boundary else "") or _string(record.get("trigger")),
+    )
+
+
+def _is_raw_compact_summary(record: dict[str, Any]) -> bool:
+    return _string(record.get("type")) == "user" and bool(record.get("isCompactSummary"))
 
 
 def _message_from_turn_context(line_number: int, timestamp: str, payload: dict[str, Any]) -> ParsedMessage:
@@ -264,6 +360,26 @@ def _message_from_response_item(line_number: int, timestamp: str, payload: dict[
     )
 
 
+def _message_from_raw_record(line_number: int, timestamp: str, record: dict[str, Any]) -> ParsedMessage:
+    record_type = _string(record.get("type"))
+    subtype = _string(record.get("subtype"))
+    content = _message_text(record.get("message")) or _summary_text(record.get("content"))
+    if subtype == "compact_boundary":
+        metadata = record.get("compactMetadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = f"compact boundary {metadata.get('trigger', '')}".strip()
+
+    return ParsedMessage(
+        line_number=line_number,
+        timestamp=timestamp,
+        record_type=record_type,
+        kind=subtype or record_type,
+        role=record_type,
+        content=content,
+    )
+
+
 def _apply_token_count(stats: ConversationStats, payload: dict[str, Any]) -> TokenUsage | None:
     info = payload.get("info")
     if not isinstance(info, dict):
@@ -309,6 +425,16 @@ def _content_text(content: Any) -> str:
                 parts.append(_string(item.get("text")) or _string(item.get("summary")))
         return "\n".join(part for part in parts if part)
     return ""
+
+
+def _message_text(message: Any) -> str:
+    if isinstance(message, dict):
+        return (
+            _content_text(message.get("content"))
+            or _string(message.get("text"))
+            or _string(message.get("summary"))
+        )
+    return _content_text(message)
 
 
 def _summary_text(value: Any) -> str:
@@ -357,3 +483,12 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_int(values: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        if key in values:
+            parsed = _int_or_none(values.get(key))
+            if parsed is not None:
+                return parsed
+    return None

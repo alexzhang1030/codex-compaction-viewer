@@ -95,8 +95,11 @@ def _event_dict(event: CompactionEvent) -> dict[str, object]:
     token_usage = event.token_usage
     return {
         "line": event.line_number,
+        "boundary_line": event.boundary_line_number,
         "timestamp": event.timestamp,
         "turn_id": event.turn_id,
+        "source": event.source,
+        "trigger": event.trigger,
         "summary_length": event.summary_length,
         "summary": event.summary,
         "truncation_mode": event.truncation_mode,
@@ -150,9 +153,16 @@ def _print_summary(session: ParsedSession, out: TextIO) -> None:
         if event.truncation_limit is not None:
             policy = f"{policy}:{event.truncation_limit}" if policy else str(event.truncation_limit)
         tokens = event.token_usage.total_tokens if event.token_usage else 0
-        print(f"#{index} line {event.line_number} turn {event.turn_id}", file=out)
+        heading = f"#{index} line {event.line_number}"
+        if event.boundary_line_number is not None:
+            heading += f" boundary {event.boundary_line_number}"
+        if event.turn_id:
+            heading += f" turn {event.turn_id}"
+        print(heading, file=out)
         if event.timestamp:
             print(f"timestamp: {event.timestamp}", file=out)
+        if event.trigger:
+            print(f"trigger: {event.trigger}", file=out)
         if policy:
             print(f"truncation: {policy}", file=out)
         if tokens:
@@ -191,4 +201,3 @@ def _compact_number(value: int) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

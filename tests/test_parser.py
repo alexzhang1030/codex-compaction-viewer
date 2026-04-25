@@ -136,6 +136,57 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(parsed.compaction_events, [])
 
+    def test_parse_jsonl_pairs_raw_boundary_with_following_compact_summary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            session = Path(tmp) / "claude-style.jsonl"
+            write_jsonl(
+                session,
+                [
+                    {
+                        "timestamp": "2026-04-25T13:00:00Z",
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "compactMetadata": {
+                            "trigger": "auto",
+                            "preCompactTokens": 15700,
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-25T13:00:02Z",
+                        "type": "user",
+                        "isCompactSummary": True,
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "The previous conversation was compacted into this summary.",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-25T13:00:03Z",
+                        "type": "assistant",
+                        "message": {
+                            "content": [{"type": "text", "text": "Ready to continue."}]
+                        },
+                    },
+                ],
+            )
+
+            parsed = parse_jsonl(session)
+
+        self.assertEqual(parsed.stats.line_count, 3)
+        self.assertEqual(parsed.stats.bad_lines, 0)
+        self.assertEqual(len(parsed.compaction_events), 1)
+        event = parsed.compaction_events[0]
+        self.assertEqual(event.source, "boundary_summary")
+        self.assertEqual(event.line_number, 2)
+        self.assertEqual(event.boundary_line_number, 1)
+        self.assertEqual(event.trigger, "auto")
+        self.assertEqual(event.token_usage.total_tokens, 15700)
+        self.assertIn("previous conversation", event.summary)
+
 
 if __name__ == "__main__":
     unittest.main()
