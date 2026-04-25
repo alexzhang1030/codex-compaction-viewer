@@ -89,3 +89,19 @@ fn summary_outputs_context_summary_details() {
     assert!(stdout.contains("A compacted context snapshot"));
     assert!(stdout.contains("tokens:10000"));
 }
+
+#[test]
+fn tui_mode_option_accepts_verbose() {
+    let output = cxv()
+        .args(["--mode", "verbose", "--tui"])
+        .output()
+        .expect("run cxv");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Interactive TUI requires a terminal"));
+}

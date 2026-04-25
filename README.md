@@ -46,6 +46,12 @@ Open the interactive viewer for one session:
 cxv --tui ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 ```
 
+Open the interactive viewer with the full event history:
+
+```bash
+cxv --tui --mode verbose ~/.codex/sessions/2026/04/25/rollout-example.jsonl
+```
+
 Scan active Codex sessions:
 
 ```bash
@@ -83,7 +89,7 @@ The TUI shows:
 - Left sidebar: discovered Codex session files, newest first.
 - Stats panel: message count, line count, compactions, token totals, context window, source path.
 - Compaction panel: highlighted compaction events and summary sizes.
-- History table: normalized Codex messages/events with compaction rows marked by `*`.
+- History table: tidy by default, showing only user messages, compactions, assistant responses, tool-call requests, and tool-call responses. Verbose mode shows every parsed event row. Compaction rows are marked by `*`.
 - Detail panel: full selected message metadata/content, or all compaction summaries.
 - Session search: `/` filters the left sidebar by project/cwd/session text. Search terms can be scoped with `project:`, `cwd:`, `session:`, or `id:`; `tag:compaction` and `has:compaction` show only sessions with compaction events.
 
@@ -96,9 +102,9 @@ Keybindings:
 | `Enter` | Focus/unfocus detail; while focused, `j` / `k` scroll detail text |
 | `/` | Edit session search text |
 | `g` | Toggle sessions with compaction events only |
+| `v` | Toggle tidy / verbose history mode |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
-| `t` | Toggle token-count events |
 | `Esc` | Return from search/detail focus; quit from history focus |
 | `q` | Quit |
 

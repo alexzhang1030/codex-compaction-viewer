@@ -1,6 +1,7 @@
 use crate::parser::{discover_sessions, parse_jsonl, CompactionEvent, ParsedSession};
+use crate::tui::TuiDisplayMode;
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -38,6 +39,25 @@ pub struct Args {
     /// Launch the interactive terminal viewer. Pass a positional FILE to open it directly.
     #[arg(long)]
     pub tui: bool,
+
+    /// TUI history display mode.
+    #[arg(long, value_enum, default_value_t = DisplayModeArg::Tidy)]
+    pub mode: DisplayModeArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DisplayModeArg {
+    Tidy,
+    Verbose,
+}
+
+impl From<DisplayModeArg> for TuiDisplayMode {
+    fn from(value: DisplayModeArg) -> Self {
+        match value {
+            DisplayModeArg::Tidy => Self::Tidy,
+            DisplayModeArg::Verbose => Self::Verbose,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +118,7 @@ pub fn main_entry() -> i32 {
             args.root.as_deref(),
             args.include_archived,
             args.file.as_deref(),
+            args.mode.into(),
         ) {
             Ok(()) => 0,
             Err(error) => {

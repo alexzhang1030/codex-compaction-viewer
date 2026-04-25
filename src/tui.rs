@@ -52,12 +52,40 @@ pub enum TuiFocus {
     SessionSearch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiDisplayMode {
+    Tidy,
+    Verbose,
+}
+
+impl TuiDisplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tidy => "tidy",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Tidy => Self::Verbose,
+            Self::Verbose => Self::Tidy,
+        }
+    }
+}
+
+impl Default for TuiDisplayMode {
+    fn default() -> Self {
+        Self::Tidy
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiState {
     pub model: TuiModel,
     pub selected_message: usize,
     pub show_summaries: bool,
-    pub show_token_events: bool,
+    pub display_mode: TuiDisplayMode,
     session_search: String,
     filter_compacted_sessions: bool,
     focus: TuiFocus,
@@ -116,9 +144,10 @@ pub fn launch(
     root: Option<&Path>,
     include_archived: bool,
     initial_file: Option<&Path>,
+    display_mode: TuiDisplayMode,
 ) -> Result<()> {
     let model = build_tui_model(root, include_archived, initial_file)?;
-    let mut state = TuiState::new(model);
+    let mut state = TuiState::with_display_mode(model, display_mode);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -137,11 +166,15 @@ pub fn launch(
 
 impl TuiState {
     pub fn new(model: TuiModel) -> Self {
+        Self::with_display_mode(model, TuiDisplayMode::default())
+    }
+
+    pub fn with_display_mode(model: TuiModel, display_mode: TuiDisplayMode) -> Self {
         Self {
             selected_message: 0,
             model,
             show_summaries: false,
-            show_token_events: false,
+            display_mode,
             session_search: String::new(),
             filter_compacted_sessions: false,
             focus: TuiFocus::History,
@@ -187,6 +220,10 @@ impl TuiState {
 
     pub fn detail_scroll(&self) -> u16 {
         self.detail_scroll
+    }
+
+    pub fn display_mode(&self) -> TuiDisplayMode {
+        self.display_mode
     }
 
     pub fn selected_message_line(&self) -> Option<usize> {
@@ -282,11 +319,15 @@ impl TuiState {
     fn visible_messages(&self) -> Vec<&ParsedMessage> {
         self.current_session()
             .map(|session| {
+                let compact_lines = compaction_lines(&session.parsed.compaction_events);
                 session
                     .parsed
                     .messages
                     .iter()
-                    .filter(|message| self.show_token_events || message.kind != "token_count")
+                    .filter(|message| match self.display_mode {
+                        TuiDisplayMode::Tidy => is_tidy_message(message, &compact_lines),
+                        TuiDisplayMode::Verbose => true,
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -464,6 +505,13 @@ impl TuiState {
         self.detail_scroll = 0;
     }
 
+    fn toggle_display_mode(&mut self) {
+        self.display_mode = self.display_mode.toggled();
+        self.selected_message = 0;
+        self.show_summaries = false;
+        self.detail_scroll = 0;
+    }
+
     fn push_session_search_char(&mut self, ch: char) {
         self.session_search.push(ch);
         self.ensure_visible_session_selected();
@@ -551,11 +599,7 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.show_summaries = !state.show_summaries;
             state.detail_scroll = 0;
         }
-        KeyCode::Char('t') => {
-            state.show_token_events = !state.show_token_events;
-            state.selected_message = 0;
-            state.detail_scroll = 0;
-        }
+        KeyCode::Char('v') => state.toggle_display_mode(),
         _ => {}
     }
     false
@@ -593,11 +637,6 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let token_events = if state.show_token_events {
-        "token events:on"
-    } else {
-        "token events:off"
-    };
     let compacted_filter = if state.filter_compacted_sessions {
         "compacted:on"
     } else {
@@ -609,7 +648,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         TuiFocus::SessionSearch => "search",
     };
     let text = format!(
-        "q quit | / search | g {compacted_filter} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries | t {token_events}"
+        "q quit | / search | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
+        state.display_mode.as_str()
     );
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -941,6 +981,22 @@ fn compaction_lines(events: &[CompactionEvent]) -> HashSet<usize> {
         }
     }
     lines
+}
+
+fn is_tidy_message(message: &ParsedMessage, compact_lines: &HashSet<usize>) -> bool {
+    if compact_lines.contains(&message.line_number) {
+        return true;
+    }
+
+    match message.role.as_str() {
+        "user" => true,
+        "assistant" => matches!(
+            message.kind.as_str(),
+            "message" | "agent_message" | "assistant"
+        ),
+        "tool_call" | "tool" => true,
+        _ => false,
+    }
 }
 
 fn display_kind(message: &ParsedMessage) -> &str {
