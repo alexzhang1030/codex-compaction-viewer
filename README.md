@@ -4,8 +4,10 @@ Inspect local Codex JSONL sessions for context summary snapshots, token usage, a
 
 `cxv` is a Rust binary. It does not require Python at runtime.
 
-The parser supports two compaction shapes:
+The parser supports these compaction shapes:
 
+- Codex rollout `type: "compacted"` checkpoints, reported with replacement-history metadata and nearest preceding token usage when available.
+- Legacy Codex `event_msg` / `payload.type: "context_compacted"` markers, used as a fallback when no nearby rollout checkpoint exists.
 - Codex `turn_context.summary` records, reported with turn id, truncation policy, and nearest preceding token usage when available.
 - Claude-style raw `system/subtype=compact_boundary` records paired with the following `user/isCompactSummary=true` record, reported with boundary line, trigger, and pre-compact token count when available.
 

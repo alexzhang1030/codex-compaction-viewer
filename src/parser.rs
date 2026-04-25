@@ -157,6 +157,7 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
     let mut parsed = ParsedSession::new(session_path);
     let mut latest_token_usage: Option<TokenUsage> = None;
     let mut pending_boundary: Option<PendingBoundary> = None;
+    let mut legacy_context_compacted_events: Vec<CompactionEvent> = Vec::new();
 
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -201,6 +202,18 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
                     .messages
                     .push(message_from_turn_context(line_number, &timestamp, payload));
             }
+            "compacted" => {
+                pending_boundary = None;
+                parsed.compaction_events.push(parse_compacted(
+                    line_number,
+                    &timestamp,
+                    payload,
+                    latest_token_usage.clone(),
+                ));
+                parsed
+                    .messages
+                    .push(message_from_compacted(line_number, &timestamp, payload));
+            }
             "event_msg" => {
                 pending_boundary = None;
                 parsed
@@ -209,6 +222,12 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
                 if string(payload.get("type")) == "token_count" {
                     parsed.stats.token_count_events += 1;
                     latest_token_usage = apply_token_count(&mut parsed.stats, payload);
+                } else if string(payload.get("type")) == "context_compacted" {
+                    legacy_context_compacted_events.push(parse_legacy_context_compacted(
+                        line_number,
+                        &timestamp,
+                        latest_token_usage.clone(),
+                    ));
                 }
             }
             "response_item" => {
@@ -267,6 +286,15 @@ pub fn parse_jsonl(path: impl AsRef<Path>) -> Result<ParsedSession> {
         }
     }
 
+    let existing_compaction_events = parsed.compaction_events.clone();
+    parsed
+        .compaction_events
+        .extend(legacy_context_compacted_events.into_iter().filter(|event| {
+            !is_duplicate_legacy_context_compacted(event, &existing_compaction_events)
+        }));
+    parsed
+        .compaction_events
+        .sort_by_key(|event| event.line_number);
     parsed.stats.message_count = parsed.messages.len();
     Ok(parsed)
 }
@@ -404,6 +432,64 @@ fn parse_raw_compact_summary(
             .map(|boundary| boundary.trigger.clone())
             .filter(|trigger| !trigger.is_empty())
             .unwrap_or_else(|| string(record.get("trigger"))),
+    })
+}
+
+fn parse_compacted(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+    latest_token_usage: Option<TokenUsage>,
+) -> CompactionEvent {
+    let replacement_history_len = replacement_history_len(payload);
+    let summary = summary_text(payload.get("message"))
+        .or_else_empty(summary_from_replacement_history(
+            payload.get("replacement_history"),
+        ))
+        .or_else_empty(format!(
+            "Compacted history checkpoint (replacement history items: {replacement_history_len})."
+        ));
+
+    CompactionEvent {
+        line_number,
+        timestamp: timestamp.to_string(),
+        turn_id: string(payload.get("turn_id")),
+        summary,
+        truncation_mode: String::new(),
+        truncation_limit: None,
+        token_usage: latest_token_usage,
+        source: "rollout_compacted".to_string(),
+        boundary_line_number: None,
+        trigger: String::new(),
+    }
+}
+
+fn parse_legacy_context_compacted(
+    line_number: usize,
+    timestamp: &str,
+    latest_token_usage: Option<TokenUsage>,
+) -> CompactionEvent {
+    CompactionEvent {
+        line_number,
+        timestamp: timestamp.to_string(),
+        turn_id: String::new(),
+        summary: "legacy context_compacted event.".to_string(),
+        truncation_mode: String::new(),
+        truncation_limit: None,
+        token_usage: latest_token_usage,
+        source: "context_compacted_event".to_string(),
+        boundary_line_number: None,
+        trigger: String::new(),
+    }
+}
+
+fn is_duplicate_legacy_context_compacted(
+    legacy_event: &CompactionEvent,
+    events: &[CompactionEvent],
+) -> bool {
+    events.iter().any(|event| {
+        event.source == "rollout_compacted"
+            && event.line_number.abs_diff(legacy_event.line_number) <= 3
     })
 }
 
@@ -553,6 +639,26 @@ fn message_from_raw_record(
     }
 }
 
+fn message_from_compacted(
+    line_number: usize,
+    timestamp: &str,
+    payload: &Map<String, Value>,
+) -> ParsedMessage {
+    let replacement_history_len = replacement_history_len(payload);
+    let summary_length = summary_text(payload.get("message")).chars().count();
+
+    ParsedMessage {
+        line_number,
+        timestamp: timestamp.to_string(),
+        record_type: "compacted".to_string(),
+        kind: "compacted".to_string(),
+        role: "system".to_string(),
+        content: format!(
+            "replacement_history={replacement_history_len} summary_chars={summary_length}"
+        ),
+    }
+}
+
 fn apply_token_count(
     stats: &mut ConversationStats,
     payload: &Map<String, Value>,
@@ -569,6 +675,37 @@ fn apply_token_count(
     stats.reasoning_output_tokens = usage.reasoning_output_tokens;
     stats.total_tokens = usage.total_tokens;
     Some(usage)
+}
+
+fn replacement_history_len(payload: &Map<String, Value>) -> usize {
+    payload
+        .get("replacement_history")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn summary_from_replacement_history(value: Option<&Value>) -> String {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return String::new();
+    };
+
+    items
+        .iter()
+        .rev()
+        .filter_map(Value::as_object)
+        .find_map(|item| {
+            let kind = string(item.get("type"));
+            if kind == "compaction" || kind == "compaction_summary" {
+                summary_text(item.get("text"))
+                    .or_else_empty(summary_text(item.get("summary")))
+                    .or_else_empty(summary_text(item.get("content")))
+                    .then_non_empty()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn token_usage(value: Option<&Value>) -> Option<TokenUsage> {
@@ -681,6 +818,7 @@ fn assign_if_present(target: &mut String, value: String) {
 
 trait EmptyFallback {
     fn or_else_empty(self, fallback: String) -> String;
+    fn then_non_empty(self) -> Option<String>;
 }
 
 impl EmptyFallback for String {
@@ -690,5 +828,9 @@ impl EmptyFallback for String {
         } else {
             self
         }
+    }
+
+    fn then_non_empty(self) -> Option<String> {
+        (!self.is_empty()).then_some(self)
     }
 }

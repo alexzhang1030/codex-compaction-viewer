@@ -181,3 +181,76 @@ fn parse_jsonl_pairs_raw_boundary_with_following_compact_summary() {
     assert_eq!(event.token_usage.as_ref().unwrap().total_tokens, 15700);
     assert!(event.summary.contains("previous conversation"));
 }
+
+#[test]
+fn parse_jsonl_counts_top_level_compacted_checkpoint() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("codex-rollout-compacted.jsonl");
+    write_jsonl(
+        &session,
+        vec![
+            json!({
+                "timestamp": "2026-04-25T15:56:20Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 12345}
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T15:56:23Z",
+                "type": "compacted",
+                "payload": {
+                    "message": "",
+                    "replacement_history": [
+                        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "before"}]},
+                        {"type": "compaction", "encrypted_content": "ciphertext"}
+                    ]
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-25T15:56:24Z",
+                "type": "event_msg",
+                "payload": {"type": "context_compacted"}
+            }),
+        ],
+    );
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+
+    assert_eq!(parsed.compaction_events.len(), 1);
+    let event = &parsed.compaction_events[0];
+    assert_eq!(event.source, "rollout_compacted");
+    assert_eq!(event.line_number, 2);
+    assert_eq!(event.token_usage.as_ref().unwrap().total_tokens, 12345);
+    assert!(event.summary.contains("replacement history items: 2"));
+    assert!(parsed.messages.iter().any(|message| {
+        message.line_number == 2
+            && message.record_type == "compacted"
+            && message.content.contains("replacement_history=2")
+    }));
+}
+
+#[test]
+fn parse_jsonl_counts_legacy_context_compacted_without_checkpoint() {
+    let tmp = TempDir::new().expect("tempdir");
+    let session = tmp.path().join("legacy-context-compacted.jsonl");
+    write_jsonl(
+        &session,
+        vec![json!({
+            "timestamp": "2026-04-25T15:56:24Z",
+            "type": "event_msg",
+            "payload": {"type": "context_compacted"}
+        })],
+    );
+
+    let parsed = parse_jsonl(&session).expect("parse session");
+
+    assert_eq!(parsed.compaction_events.len(), 1);
+    let event = &parsed.compaction_events[0];
+    assert_eq!(event.source, "context_compacted_event");
+    assert_eq!(event.line_number, 1);
+    assert!(event.summary.contains("legacy context_compacted event"));
+}
