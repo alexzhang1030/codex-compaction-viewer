@@ -45,12 +45,23 @@ pub struct TuiModel {
     pub selected_session: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiFocus {
+    History,
+    Detail,
+    SessionSearch,
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiState {
     pub model: TuiModel,
     pub selected_message: usize,
     pub show_summaries: bool,
     pub show_token_events: bool,
+    session_search: String,
+    filter_compacted_sessions: bool,
+    focus: TuiFocus,
+    detail_scroll: u16,
 }
 
 pub fn build_tui_model(
@@ -131,7 +142,51 @@ impl TuiState {
             model,
             show_summaries: false,
             show_token_events: false,
+            session_search: String::new(),
+            filter_compacted_sessions: false,
+            focus: TuiFocus::History,
+            detail_scroll: 0,
         }
+    }
+
+    pub fn set_session_search(&mut self, query: impl Into<String>) {
+        let previous_session = self.model.selected_session;
+        self.session_search = query.into();
+        self.ensure_visible_session_selected();
+        if self.model.selected_session != previous_session {
+            self.selected_message = 0;
+            self.show_summaries = false;
+        }
+        self.detail_scroll = 0;
+    }
+
+    pub fn session_search(&self) -> &str {
+        &self.session_search
+    }
+
+    pub fn visible_session_ids(&self) -> Vec<&str> {
+        self.visible_session_indices()
+            .into_iter()
+            .filter_map(|index| self.model.sessions.get(index))
+            .map(|session| session.session_id.as_str())
+            .collect()
+    }
+
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.current_session()
+            .map(|session| session.session_id.as_str())
+    }
+
+    pub fn compaction_session_filter_enabled(&self) -> bool {
+        self.filter_compacted_sessions
+    }
+
+    pub fn focus(&self) -> TuiFocus {
+        self.focus
+    }
+
+    pub fn detail_scroll(&self) -> u16 {
+        self.detail_scroll
     }
 
     pub fn selected_message_line(&self) -> Option<usize> {
@@ -198,6 +253,7 @@ impl TuiState {
             .unwrap_or(rows[0]);
         self.selected_message = next;
         self.show_summaries = false;
+        self.detail_scroll = 0;
     }
 
     pub fn jump_previous_compaction(&mut self) {
@@ -213,10 +269,14 @@ impl TuiState {
             .unwrap_or_else(|| *rows.last().expect("non-empty rows"));
         self.selected_message = previous;
         self.show_summaries = false;
+        self.detail_scroll = 0;
     }
 
     fn current_session(&self) -> Option<&TuiSession> {
-        self.model.sessions.get(self.model.selected_session)
+        self.model
+            .sessions
+            .get(self.model.selected_session)
+            .filter(|session| self.session_matches(session))
     }
 
     fn visible_messages(&self) -> Vec<&ParsedMessage> {
@@ -230,6 +290,41 @@ impl TuiState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn visible_session_indices(&self) -> Vec<usize> {
+        self.model
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| self.session_matches(session).then_some(index))
+            .collect()
+    }
+
+    fn session_matches(&self, session: &TuiSession) -> bool {
+        if self.filter_compacted_sessions && session.compactions == 0 {
+            return false;
+        }
+
+        self.session_search
+            .split_whitespace()
+            .all(|term| session_matches_term(session, term))
+    }
+
+    fn ensure_visible_session_selected(&mut self) {
+        let indices = self.visible_session_indices();
+        if indices.is_empty() {
+            self.selected_message = 0;
+            self.detail_scroll = 0;
+            return;
+        }
+
+        if !indices.contains(&self.model.selected_session) {
+            self.model.selected_session = indices[0];
+            self.selected_message = 0;
+            self.show_summaries = false;
+            self.detail_scroll = 0;
+        }
     }
 
     fn compaction_rows(&self) -> Vec<usize> {
@@ -327,22 +422,58 @@ impl TuiState {
         }
         self.selected_message = move_index(self.selected_message, delta, count);
         self.show_summaries = false;
+        self.detail_scroll = 0;
     }
 
     fn page_message(&mut self, delta: isize) {
         self.move_message(delta * 10);
     }
 
+    fn scroll_detail(&mut self, delta: isize) {
+        if delta.is_negative() {
+            self.detail_scroll = self
+                .detail_scroll
+                .saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
+        }
+    }
+
     fn move_session(&mut self, delta: isize) {
-        let count = self.model.sessions.len();
-        if count == 0 {
+        let indices = self.visible_session_indices();
+        if indices.is_empty() {
             self.model.selected_session = 0;
             self.selected_message = 0;
+            self.detail_scroll = 0;
             return;
         }
-        self.model.selected_session = move_index(self.model.selected_session, delta, count);
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.model.selected_session)
+            .unwrap_or(0);
+        let next_position = move_index(current_position, delta, indices.len());
+        self.model.selected_session = indices[next_position];
         self.selected_message = 0;
         self.show_summaries = false;
+        self.detail_scroll = 0;
+    }
+
+    fn toggle_compaction_session_filter(&mut self) {
+        self.filter_compacted_sessions = !self.filter_compacted_sessions;
+        self.ensure_visible_session_selected();
+        self.detail_scroll = 0;
+    }
+
+    fn push_session_search_char(&mut self, ch: char) {
+        self.session_search.push(ch);
+        self.ensure_visible_session_selected();
+        self.detail_scroll = 0;
+    }
+
+    fn pop_session_search_char(&mut self) {
+        self.session_search.pop();
+        self.ensure_visible_session_selected();
+        self.detail_scroll = 0;
     }
 }
 
@@ -363,9 +494,48 @@ fn run_terminal(
     }
 }
 
-fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
+pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if state.focus == TuiFocus::SessionSearch {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => state.focus = TuiFocus::History,
+            KeyCode::Backspace => state.pop_session_search_char(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.set_session_search("");
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                state.push_session_search_char(ch);
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    if key.code == KeyCode::Char('q') {
+        return true;
+    }
+
+    if state.focus == TuiFocus::Detail {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => state.focus = TuiFocus::History,
+            KeyCode::Char('j') | KeyCode::Down => state.scroll_detail(1),
+            KeyCode::Char('k') | KeyCode::Up => state.scroll_detail(-1),
+            KeyCode::PageDown => state.scroll_detail(10),
+            KeyCode::PageUp => state.scroll_detail(-10),
+            _ => {}
+        }
+        return false;
+    }
+
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Esc => return true,
+        KeyCode::Char('/') => state.focus = TuiFocus::SessionSearch,
+        KeyCode::Enter => {
+            state.focus = TuiFocus::Detail;
+            state.detail_scroll = 0;
+        }
+        KeyCode::Char('g') => state.toggle_compaction_session_filter(),
         KeyCode::Char('j') | KeyCode::Down => state.move_message(1),
         KeyCode::Char('k') | KeyCode::Up => state.move_message(-1),
         KeyCode::PageDown => state.page_message(1),
@@ -377,10 +547,14 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         }
         KeyCode::Char('C') => state.jump_previous_compaction(),
         KeyCode::Char('c') => state.jump_next_compaction(),
-        KeyCode::Char('s') => state.show_summaries = !state.show_summaries,
+        KeyCode::Char('s') => {
+            state.show_summaries = !state.show_summaries;
+            state.detail_scroll = 0;
+        }
         KeyCode::Char('t') => {
             state.show_token_events = !state.show_token_events;
             state.selected_message = 0;
+            state.detail_scroll = 0;
         }
         _ => {}
     }
@@ -424,8 +598,18 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         "token events:off"
     };
+    let compacted_filter = if state.filter_compacted_sessions {
+        "compacted:on"
+    } else {
+        "compacted:off"
+    };
+    let focus = match state.focus {
+        TuiFocus::History => "history",
+        TuiFocus::Detail => "detail",
+        TuiFocus::SessionSearch => "search",
+    };
     let text = format!(
-        "q quit | h/l sessions | j/k messages | c/C compactions | s summaries | t {token_events}"
+        "q quit | / search | g {compacted_filter} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries | t {token_events}"
     );
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -434,13 +618,15 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_sessions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let visible_indices = state.visible_session_indices();
     let items = if state.model.sessions.is_empty() {
         vec![ListItem::new("No Codex sessions found")]
+    } else if visible_indices.is_empty() {
+        vec![ListItem::new("No sessions match the current search")]
     } else {
-        state
-            .model
-            .sessions
+        visible_indices
             .iter()
+            .filter_map(|index| state.model.sessions.get(*index))
             .map(|session| {
                 let title = format!(
                     "{}  compactions:{}",
@@ -470,11 +656,18 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
 
     let mut list_state = ListState::default();
-    if !state.model.sessions.is_empty() {
-        list_state.select(Some(state.model.selected_session));
+    if !visible_indices.is_empty() {
+        list_state.select(
+            visible_indices
+                .iter()
+                .position(|index| *index == state.model.selected_session),
+        );
     }
     let list = List::new(items)
-        .block(Block::default().title("Sessions").borders(Borders::ALL))
+        .block(focused_block(
+            sessions_title(state),
+            state.focus == TuiFocus::SessionSearch,
+        ))
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut list_state);
@@ -482,11 +675,14 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn draw_session_content(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(session) = state.current_session() else {
-        let empty = Paragraph::new(
-            "No Codex sessions found.\nUse --root to point at a Codex home or run Codex first.",
-        )
-        .block(Block::default().title("Session").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+        let message = if state.model.sessions.is_empty() {
+            "No Codex sessions found.\nUse --root to point at a Codex home or run Codex first."
+        } else {
+            "No sessions match the current search or tag filter."
+        };
+        let empty = Paragraph::new(message)
+            .block(Block::default().title("Session").borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
         frame.render_widget(empty, area);
         return;
     };
@@ -614,7 +810,10 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(Block::default().title("History").borders(Borders::ALL))
+    .block(focused_block(
+        "History".to_string(),
+        state.focus == TuiFocus::History,
+    ))
     .row_highlight_style(Style::default().fg(Color::Black).bg(Color::White));
 
     frame.render_stateful_widget(table, area, &mut table_state);
@@ -627,7 +826,11 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         "Detail"
     };
     let paragraph = Paragraph::new(state.selected_detail_text())
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(focused_block(
+            title.to_string(),
+            state.focus == TuiFocus::Detail,
+        ))
+        .scroll((state.detail_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -663,6 +866,70 @@ fn session_row(parsed: ParsedSession) -> TuiSession {
         model_context_window: stats.model_context_window,
         parsed,
     }
+}
+
+fn focused_block(title: String, focused: bool) -> Block<'static> {
+    let block = Block::default().title(title).borders(Borders::ALL);
+    if focused {
+        block
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else {
+        block
+    }
+}
+
+fn sessions_title(state: &TuiState) -> String {
+    let mut parts = vec!["Sessions".to_string()];
+    if !state.session_search.is_empty() {
+        parts.push(format!("/{}", short(&state.session_search, 24)));
+    }
+    if state.filter_compacted_sessions {
+        parts.push("tag:compaction".to_string());
+    }
+    parts.join(" ")
+}
+
+fn session_matches_term(session: &TuiSession, term: &str) -> bool {
+    let term = term.trim().to_ascii_lowercase();
+    if term.is_empty() {
+        return true;
+    }
+
+    if let Some((scope, value)) = term.split_once(':') {
+        return match scope {
+            "tag" | "has" => is_compaction_tag(value) && session.compactions > 0,
+            "project" | "cwd" => {
+                contains_lower(&session.cwd, value)
+                    || contains_lower(&session.path.display().to_string(), value)
+            }
+            "session" | "id" => contains_lower(&session.session_id, value),
+            _ => session_contains_text(session, &term),
+        };
+    }
+
+    session_contains_text(session, &term)
+}
+
+fn session_contains_text(session: &TuiSession, needle: &str) -> bool {
+    contains_lower(&session.session_id, needle)
+        || contains_lower(&session.cwd, needle)
+        || contains_lower(&session.path.display().to_string(), needle)
+}
+
+fn contains_lower(value: &str, needle: &str) -> bool {
+    value.to_ascii_lowercase().contains(needle)
+}
+
+fn is_compaction_tag(value: &str) -> bool {
+    matches!(
+        value,
+        "compaction" | "compactions" | "compact" | "compacted"
+    )
 }
 
 fn compaction_lines(events: &[CompactionEvent]) -> HashSet<usize> {

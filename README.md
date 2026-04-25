@@ -83,6 +83,7 @@ The TUI shows:
 - Compaction panel: highlighted compaction events and summary sizes.
 - History table: normalized Codex messages/events with compaction rows marked by `*`.
 - Detail panel: full selected message metadata/content, or all compaction summaries.
+- Session search: `/` filters the left sidebar by project/cwd/session text. Search terms can be scoped with `project:`, `cwd:`, `session:`, or `id:`; `tag:compaction` and `has:compaction` show only sessions with compaction events.
 
 Keybindings:
 
@@ -90,10 +91,14 @@ Keybindings:
 | --- | --- |
 | `h` / `l` or left / right | Previous / next session |
 | `j` / `k` or up / down | Move through conversation history |
+| `Enter` | Focus/unfocus detail; while focused, `j` / `k` scroll detail text |
+| `/` | Edit session search text |
+| `g` | Toggle sessions with compaction events only |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
 | `t` | Toggle token-count events |
-| `q` or `Esc` | Quit |
+| `Esc` | Return from search/detail focus; quit from history focus |
+| `q` | Quit |
 
 ## Data Model
 
