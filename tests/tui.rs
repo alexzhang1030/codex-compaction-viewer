@@ -1,4 +1,6 @@
-use codex_compaction_viewer::tui::{build_tui_model, handle_key, handle_mouse, TuiFocus, TuiState};
+use codex_compaction_viewer::tui::{
+    build_tui_model, handle_key, handle_mouse, TuiFocus, TuiSelectionBlock, TuiState,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -435,6 +437,65 @@ fn tui_mouse_capture_can_be_toggled_for_terminal_selection() {
     );
 
     assert_eq!(state.selected_message_line(), Some(6));
+}
+
+#[test]
+fn tui_mouse_drag_selects_text_inside_one_block_with_mouse_capture_on() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_mixed_session(&tmp.path().join("sessions/2026/04/25/rollout-mixed.jsonl"));
+
+    let model = build_tui_model(Some(tmp.path()), false, None).expect("build model");
+    let mut state = TuiState::new(model);
+    let area = Rect::new(0, 0, 120, 40);
+
+    assert!(state.mouse_capture_enabled());
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 42, 14),
+        area,
+    );
+    assert_eq!(state.selected_message_line(), Some(7));
+
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 39, 25),
+        area,
+    );
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Drag(MouseButton::Left), 52, 25),
+        area,
+    );
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Up(MouseButton::Left), 52, 25),
+        area,
+    );
+
+    assert_eq!(state.selection_block(), Some(TuiSelectionBlock::Detail));
+    assert_eq!(state.selected_text(), Some("function_call".to_string()));
+
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 39, 25),
+        area,
+    );
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Drag(MouseButton::Left), 119, 39),
+        area,
+    );
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Up(MouseButton::Left), 119, 39),
+        area,
+    );
+
+    let selected = state.selected_text().expect("selected detail text");
+    assert!(selected.contains("function_call line 7"));
+    assert!(selected.contains("cargo test"));
+    assert!(!selected.contains("mixed-session"));
+    assert!(!selected.contains("Compacted context to keep."));
 }
 
 #[test]

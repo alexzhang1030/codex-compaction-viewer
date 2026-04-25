@@ -113,6 +113,7 @@ The TUI shows:
 - Detail panel: full selected message metadata/content, or all compaction summaries.
 - Session search: `/` filters the left sidebar by project/cwd/session text. Search terms can be scoped with `project:`, `cwd:`, `session:`, or `id:`; `tag:compaction` and `has:compaction` show only sessions with compaction events.
 - Raw body popup: `r` opens the selected row's raw tool-call request body, tool response body, and source payload.
+- Block selection: drag inside a TUI block to select only that block's text; dragging outside the block stays clipped to the original block.
 
 Keybindings:
 
@@ -126,6 +127,7 @@ Keybindings:
 | `v` | Toggle tidy / verbose history mode |
 | `m` | Toggle mouse capture; when off, terminal text selection works normally |
 | `r` | Open/close raw request/response body popup |
+| `y` | Copy selected block text to the terminal clipboard with OSC 52 |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
 | `Esc` | Return from search/detail focus; quit from history focus |
@@ -138,10 +140,11 @@ Mouse support:
 | Left click session | Select session |
 | Left click history row | Select history row |
 | Left click detail | Focus detail |
+| Left drag inside block | Select text scoped to that block |
 | Wheel | Move history/session selection, or scroll detail/raw popup |
 | Right click raw popup | Close popup |
 
-Press `m` or start with `--no-mouse` to disable mouse capture when you need to select text in the terminal. Click and wheel navigation are inactive while mouse capture is off; press `m` again to re-enable them.
+Mouse capture is enabled by default so the TUI can support block-scoped selection, clicks, and wheel navigation. Press `m` or start with `--no-mouse` only when you want native terminal selection as a fallback; click, wheel, and block selection are inactive while mouse capture is off.
 
 ## Data Model
 

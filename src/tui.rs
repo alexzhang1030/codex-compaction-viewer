@@ -23,7 +23,7 @@ use ratatui::{
 };
 use std::{
     collections::HashSet,
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -79,6 +79,29 @@ impl TuiDisplayMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiSelectionBlock {
+    Sessions,
+    Stats,
+    Compactions,
+    History,
+    Detail,
+    RawPopup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionPoint {
+    block: TuiSelectionBlock,
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiSelection {
+    anchor: SelectionPoint,
+    cursor: SelectionPoint,
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiState {
     pub model: TuiModel,
@@ -92,12 +115,16 @@ pub struct TuiState {
     detail_scroll: u16,
     raw_popup_scroll: u16,
     mouse_capture_enabled: bool,
+    selection_anchor: Option<SelectionPoint>,
+    selection: Option<TuiSelection>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TuiLayout {
     title: Rect,
     sessions: Rect,
+    stats: Rect,
+    compactions: Rect,
     history: Rect,
     detail: Rect,
     footer: Rect,
@@ -225,6 +252,8 @@ impl TuiState {
             detail_scroll: 0,
             raw_popup_scroll: 0,
             mouse_capture_enabled,
+            selection_anchor: None,
+            selection: None,
         }
     }
 
@@ -237,6 +266,7 @@ impl TuiState {
             self.show_summaries = false;
         }
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 
     pub fn session_search(&self) -> &str {
@@ -284,6 +314,77 @@ impl TuiState {
         self.mouse_capture_enabled
     }
 
+    pub fn selection_block(&self) -> Option<TuiSelectionBlock> {
+        self.selection.map(|selection| selection.anchor.block)
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.normalized_selection()?;
+        let text = self.selection_block_text(selection.0.block);
+        selected_text_from_range(&text, selection)
+    }
+
+    fn normalized_selection(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        let selection = self.selection?;
+        if selection.anchor.block != selection.cursor.block {
+            return None;
+        }
+        let (start, end) = if (selection.anchor.row, selection.anchor.column)
+            <= (selection.cursor.row, selection.cursor.column)
+        {
+            (selection.anchor, selection.cursor)
+        } else {
+            (selection.cursor, selection.anchor)
+        };
+        if start.row == end.row && start.column == end.column {
+            None
+        } else {
+            Some((start, end))
+        }
+    }
+
+    fn begin_selection(&mut self, point: SelectionPoint) {
+        self.selection_anchor = Some(point);
+        self.selection = None;
+    }
+
+    fn update_selection(&mut self, point: SelectionPoint) {
+        let Some(anchor) = self.selection_anchor else {
+            return;
+        };
+        if anchor.block != point.block {
+            return;
+        }
+        self.selection = Some(TuiSelection {
+            anchor,
+            cursor: point,
+        });
+    }
+
+    fn finish_selection(&mut self, point: SelectionPoint) {
+        self.update_selection(point);
+        self.selection_anchor = None;
+        if self.selected_text().is_none() {
+            self.selection = None;
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection = None;
+    }
+
+    fn selection_block_text(&self, block: TuiSelectionBlock) -> String {
+        match block {
+            TuiSelectionBlock::Sessions => self.sessions_text(),
+            TuiSelectionBlock::Stats => self.stats_text(),
+            TuiSelectionBlock::Compactions => self.compactions_text(),
+            TuiSelectionBlock::History => self.history_text(),
+            TuiSelectionBlock::Detail => self.selected_detail_text(),
+            TuiSelectionBlock::RawPopup => self.raw_popup_text(),
+        }
+    }
+
     pub fn footer_help_text(&self) -> String {
         let compacted_filter = if self.filter_compacted_sessions {
             "compacted:on"
@@ -300,8 +401,12 @@ impl TuiState {
             TuiFocus::Detail => "detail",
             TuiFocus::SessionSearch => "search",
         };
+        let selection = self
+            .selected_text()
+            .map(|text| format!(" | selected:{} chars y copy", text.chars().count()))
+            .unwrap_or_default();
         format!(
-            "q quit | / search | r raw | m {mouse_capture} | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
+            "q quit | / search | r raw | m {mouse_capture} | drag select | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries{selection}",
             self.display_mode.as_str()
         )
     }
@@ -357,6 +462,81 @@ impl TuiState {
         } else {
             output
         }
+    }
+
+    fn sessions_text(&self) -> String {
+        let visible_indices = self.visible_session_indices();
+        if self.model.sessions.is_empty() {
+            return "No Codex sessions found".to_string();
+        }
+        if visible_indices.is_empty() {
+            return "No sessions match the current search".to_string();
+        }
+
+        visible_indices
+            .iter()
+            .filter_map(|index| self.model.sessions.get(*index))
+            .flat_map(|session| {
+                let cwd = if session.cwd.is_empty() {
+                    session.path.display().to_string()
+                } else {
+                    session.cwd.clone()
+                };
+                [
+                    format!(
+                        "{}  compactions:{}",
+                        short(&session.session_id, 18),
+                        session.compactions
+                    ),
+                    format!(
+                        "{} lines:{} tokens:{}",
+                        short(&cwd, 32),
+                        session.lines,
+                        compact_number(session.total_tokens)
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn stats_text(&self) -> String {
+        let Some(session) = self.current_session() else {
+            return "No session selected.".to_string();
+        };
+        stats_lines(session).join("\n")
+    }
+
+    fn compactions_text(&self) -> String {
+        let Some(session) = self.current_session() else {
+            return "No session selected.".to_string();
+        };
+        compaction_lines_text(session).join("\n")
+    }
+
+    fn history_text(&self) -> String {
+        let compaction_lines = self
+            .current_session()
+            .map(|session| compaction_lines(&session.parsed.compaction_events))
+            .unwrap_or_default();
+        let mut lines =
+            vec!["Line    Time       Type              Role          Preview".to_string()];
+        lines.extend(self.visible_messages().into_iter().map(|message| {
+            let marker = if compaction_lines.contains(&message.line_number) {
+                "*"
+            } else {
+                ""
+            };
+            format!(
+                "{:<7} {:<10} {:<17} {:<13} {}",
+                format!("{}{}", marker, message.line_number),
+                short_time(&message.timestamp),
+                short(display_kind(message), 16),
+                short(&message.role, 12),
+                short(&message.content.replace('\n', " "), 72)
+            )
+        }));
+        lines.join("\n")
     }
 
     pub fn compaction_summary_text(&self) -> String {
@@ -591,6 +771,7 @@ impl TuiState {
         self.selected_message = move_index(self.selected_message, delta, count);
         self.show_summaries = false;
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 
     fn page_message(&mut self, delta: isize) {
@@ -620,11 +801,13 @@ impl TuiState {
     fn toggle_raw_popup(&mut self) {
         self.show_raw_popup = !self.show_raw_popup;
         self.raw_popup_scroll = 0;
+        self.clear_selection();
     }
 
     fn close_raw_popup(&mut self) {
         self.show_raw_popup = false;
         self.raw_popup_scroll = 0;
+        self.clear_selection();
     }
 
     fn toggle_mouse_capture(&mut self) {
@@ -650,12 +833,14 @@ impl TuiState {
         self.show_raw_popup = false;
         self.detail_scroll = 0;
         self.raw_popup_scroll = 0;
+        self.clear_selection();
     }
 
     fn toggle_compaction_session_filter(&mut self) {
         self.filter_compacted_sessions = !self.filter_compacted_sessions;
         self.ensure_visible_session_selected();
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 
     fn toggle_display_mode(&mut self) {
@@ -663,18 +848,21 @@ impl TuiState {
         self.selected_message = 0;
         self.show_summaries = false;
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 
     fn push_session_search_char(&mut self, ch: char) {
         self.session_search.push(ch);
         self.ensure_visible_session_selected();
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 
     fn pop_session_search_char(&mut self) {
         self.session_search.pop();
         self.ensure_visible_session_selected();
         self.detail_scroll = 0;
+        self.clear_selection();
     }
 }
 
@@ -688,6 +876,10 @@ fn run_terminal(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
+                    if should_copy_selection(state, key) {
+                        copy_selection_to_clipboard(terminal, state)?;
+                        continue;
+                    }
                     let previous_mouse_capture = state.mouse_capture_enabled();
                     if handle_key(state, key) {
                         return Ok(());
@@ -707,6 +899,25 @@ fn run_terminal(
             }
         }
     }
+}
+
+fn should_copy_selection(state: &TuiState, key: KeyEvent) -> bool {
+    state.focus != TuiFocus::SessionSearch
+        && key.code == KeyCode::Char('y')
+        && key.modifiers.is_empty()
+        && state.selected_text().is_some()
+}
+
+fn copy_selection_to_clipboard(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &TuiState,
+) -> Result<()> {
+    let Some(text) = state.selected_text() else {
+        return Ok(());
+    };
+    write!(terminal.backend_mut(), "{}", osc52_copy_sequence(&text))?;
+    terminal.backend_mut().flush()?;
+    Ok(())
 }
 
 fn sync_mouse_capture(
@@ -812,9 +1023,31 @@ pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     let layout = tui_layout(area);
     if state.show_raw_popup {
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(point) = selection_point_at(state, layout, mouse.column, mouse.row) {
+                    state.begin_selection(point);
+                } else {
+                    state.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(point) = selection_drag_point(state, layout, mouse.column, mouse.row) {
+                    state.update_selection(point);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(point) = selection_drag_point(state, layout, mouse.column, mouse.row) {
+                    state.finish_selection(point);
+                } else {
+                    state.clear_selection();
+                }
+            }
             MouseEventKind::ScrollDown => state.scroll_raw_popup(3),
             MouseEventKind::ScrollUp => state.scroll_raw_popup(-3),
-            MouseEventKind::Down(MouseButton::Right) => state.close_raw_popup(),
+            MouseEventKind::Down(MouseButton::Right) => {
+                state.clear_selection();
+                state.close_raw_popup();
+            }
             _ => {}
         }
         return;
@@ -822,6 +1055,11 @@ pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(point) = selection_point_at(state, layout, mouse.column, mouse.row) {
+                state.begin_selection(point);
+            } else {
+                state.clear_selection();
+            }
             if contains(layout.sessions, mouse.column, mouse.row) {
                 select_session_at(state, layout.sessions, mouse.row);
                 state.focus = TuiFocus::History;
@@ -830,6 +1068,18 @@ pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
                 state.focus = TuiFocus::History;
             } else if contains(layout.detail, mouse.column, mouse.row) {
                 state.focus = TuiFocus::Detail;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(point) = selection_drag_point(state, layout, mouse.column, mouse.row) {
+                state.update_selection(point);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(point) = selection_drag_point(state, layout, mouse.column, mouse.row) {
+                state.finish_selection(point);
+            } else {
+                state.clear_selection();
             }
         }
         MouseEventKind::ScrollDown => {
@@ -854,6 +1104,207 @@ pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
         }
         _ => {}
     }
+}
+
+fn selection_point_at(
+    state: &TuiState,
+    layout: TuiLayout,
+    column: u16,
+    row: u16,
+) -> Option<SelectionPoint> {
+    let block = selection_block_at(state, layout, column, row)?;
+    Some(selection_point_for_block(state, layout, block, column, row))
+}
+
+fn selection_drag_point(
+    state: &TuiState,
+    layout: TuiLayout,
+    column: u16,
+    row: u16,
+) -> Option<SelectionPoint> {
+    let block = state.selection_anchor?.block;
+    Some(selection_point_for_block(state, layout, block, column, row))
+}
+
+fn selection_block_at(
+    state: &TuiState,
+    layout: TuiLayout,
+    column: u16,
+    row: u16,
+) -> Option<TuiSelectionBlock> {
+    if state.show_raw_popup {
+        return contains(layout.popup, column, row).then_some(TuiSelectionBlock::RawPopup);
+    }
+
+    [
+        (TuiSelectionBlock::Sessions, layout.sessions),
+        (TuiSelectionBlock::Stats, layout.stats),
+        (TuiSelectionBlock::Compactions, layout.compactions),
+        (TuiSelectionBlock::History, layout.history),
+        (TuiSelectionBlock::Detail, layout.detail),
+    ]
+    .into_iter()
+    .find_map(|(block, area)| contains(area, column, row).then_some(block))
+}
+
+fn selection_point_for_block(
+    state: &TuiState,
+    layout: TuiLayout,
+    block: TuiSelectionBlock,
+    column: u16,
+    row: u16,
+) -> SelectionPoint {
+    let area = selection_area(layout, block);
+    let inner = inner_area(area);
+    let relative_column = if inner.width == 0 || column <= inner.x {
+        0
+    } else {
+        let right = inner.x.saturating_add(inner.width);
+        column.min(right).saturating_sub(inner.x) as usize
+    };
+    let visual_row = if inner.height == 0 || row <= inner.y {
+        0
+    } else {
+        let bottom = inner.y.saturating_add(inner.height.saturating_sub(1));
+        row.min(bottom).saturating_sub(inner.y) as usize
+    };
+    SelectionPoint {
+        block,
+        row: visual_row + selection_scroll(state, block) as usize,
+        column: relative_column,
+    }
+}
+
+fn selection_area(layout: TuiLayout, block: TuiSelectionBlock) -> Rect {
+    match block {
+        TuiSelectionBlock::Sessions => layout.sessions,
+        TuiSelectionBlock::Stats => layout.stats,
+        TuiSelectionBlock::Compactions => layout.compactions,
+        TuiSelectionBlock::History => layout.history,
+        TuiSelectionBlock::Detail => layout.detail,
+        TuiSelectionBlock::RawPopup => layout.popup,
+    }
+}
+
+fn selection_scroll(state: &TuiState, block: TuiSelectionBlock) -> u16 {
+    match block {
+        TuiSelectionBlock::Detail => state.detail_scroll,
+        TuiSelectionBlock::RawPopup => state.raw_popup_scroll,
+        _ => 0,
+    }
+}
+
+fn inner_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn selected_text_from_range(
+    text: &str,
+    (start, end): (SelectionPoint, SelectionPoint),
+) -> Option<String> {
+    let lines = text.split('\n').collect::<Vec<_>>();
+    if start.row >= lines.len() {
+        return None;
+    }
+
+    let end_row = end.row.min(lines.len().saturating_sub(1));
+    let mut output = Vec::new();
+    for (row, line) in lines.iter().enumerate().take(end_row + 1).skip(start.row) {
+        let line_len = line.chars().count();
+        let start_column = if row == start.row {
+            start.column.min(line_len)
+        } else {
+            0
+        };
+        let end_column = if row == end_row {
+            end.column.min(line_len)
+        } else {
+            line_len
+        };
+        if start_column <= end_column {
+            output.push(slice_chars(line, start_column, end_column));
+        }
+    }
+
+    let selected = output.join("\n");
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn osc52_copy_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        let combined = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+
+        output.push(TABLE[((combined >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((combined >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((combined >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(combined & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn selectable_text(state: &TuiState, block: TuiSelectionBlock, text: String) -> Text<'static> {
+    let Some((start, end)) = state.normalized_selection() else {
+        return Text::from(text);
+    };
+    if start.block != block {
+        return Text::from(text);
+    }
+
+    let selected_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let lines = text
+        .split('\n')
+        .enumerate()
+        .map(|(row, line)| {
+            if row < start.row || row > end.row {
+                return Line::from(line.to_string());
+            }
+            let line_len = line.chars().count();
+            let start_column = if row == start.row {
+                start.column.min(line_len)
+            } else {
+                0
+            };
+            let end_column = if row == end.row {
+                end.column.min(line_len)
+            } else {
+                line_len
+            };
+
+            if start_column >= end_column {
+                return Line::from(line.to_string());
+            }
+
+            Line::from(vec![
+                Span::raw(slice_chars(line, 0, start_column)),
+                Span::styled(slice_chars(line, start_column, end_column), selected_style),
+                Span::raw(slice_chars(line, end_column, line_len)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    Text::from(lines)
 }
 
 fn draw(frame: &mut Frame<'_>, state: &TuiState) {
@@ -888,6 +1339,8 @@ fn tui_layout(area: Rect) -> TuiLayout {
     TuiLayout {
         title: root[0],
         sessions: body[0],
+        stats: content[0],
+        compactions: content[1],
         history: content[2],
         detail: content[3],
         footer: root[2],
@@ -1019,7 +1472,7 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_session_content(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let Some(session) = state.current_session() else {
+    let Some(_session) = state.current_session() else {
         let message = if state.model.sessions.is_empty() {
             "No Codex sessions found.\nUse --root to point at a Codex home or run Codex first."
         } else {
@@ -1034,75 +1487,34 @@ fn draw_session_content(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let chunks = session_content_layout(area);
 
-    draw_stats(frame, chunks[0], session);
-    draw_compactions(frame, chunks[1], session);
+    draw_stats(frame, chunks[0], state);
+    draw_compactions(frame, chunks[1], state);
     draw_messages(frame, chunks[2], state);
     draw_detail(frame, chunks[3], state);
 }
 
-fn draw_stats(frame: &mut Frame<'_>, area: Rect, session: &TuiSession) {
-    let session_path = session.path.display().to_string();
-    let text = vec![
-        Line::from(vec![
-            Span::styled("Session ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(short(&session.session_id, 36)),
-            Span::raw("  "),
-            Span::styled("CWD ", Style::default().fg(Color::DarkGray)),
-            Span::raw(short(&session.cwd, 60)),
-        ]),
-        Line::from(vec![Span::raw(format!(
-            "messages:{} lines:{} compactions:{} tokens:{} context:{}",
-            session.messages,
-            session.lines,
-            session.compactions,
-            compact_number(session.total_tokens),
-            compact_number(session.model_context_window)
-        ))]),
-        Line::from(Span::styled(
-            short(&session_path, 120),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+fn draw_stats(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().title("Stats").borders(Borders::ALL)),
+        Paragraph::new(selectable_text(
+            state,
+            TuiSelectionBlock::Stats,
+            state.stats_text(),
+        ))
+        .block(Block::default().title("Stats").borders(Borders::ALL)),
         area,
     );
 }
 
-fn draw_compactions(frame: &mut Frame<'_>, area: Rect, session: &TuiSession) {
-    let text = if session.parsed.compaction_events.is_empty() {
-        Text::from("No compaction events in this session.")
-    } else {
-        let lines = session
-            .parsed
-            .compaction_events
-            .iter()
-            .enumerate()
-            .take(3)
-            .map(|(index, event)| {
-                let tokens = event
-                    .token_usage
-                    .as_ref()
-                    .map(|usage| compact_number(usage.total_tokens))
-                    .unwrap_or_else(|| "-".to_string());
-                Line::from(format!(
-                    "{}. line {} trigger:{} tokens:{} summary:{} chars",
-                    index + 1,
-                    event.line_number,
-                    empty_dash(&event.trigger),
-                    tokens,
-                    event.summary_length()
-                ))
-            })
-            .collect::<Vec<_>>();
-        Text::from(lines)
-    };
-
+fn draw_compactions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().title("Compactions").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(selectable_text(
+            state,
+            TuiSelectionBlock::Compactions,
+            state.compactions_text(),
+        ))
+        .style(Style::default().fg(Color::Yellow))
+        .block(Block::default().title("Compactions").borders(Borders::ALL))
+        .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -1162,23 +1574,80 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         "Detail"
     };
-    let paragraph = Paragraph::new(state.selected_detail_text())
-        .block(focused_block(
-            title.to_string(),
-            state.focus == TuiFocus::Detail,
-        ))
-        .scroll((state.detail_scroll, 0))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(selectable_text(
+        state,
+        TuiSelectionBlock::Detail,
+        state.selected_detail_text(),
+    ))
+    .block(focused_block(
+        title.to_string(),
+        state.focus == TuiFocus::Detail,
+    ))
+    .scroll((state.detail_scroll, 0))
+    .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn draw_raw_popup(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Clear, area);
-    let paragraph = Paragraph::new(state.raw_popup_text())
-        .block(focused_block("Raw Body  Esc/q close".to_string(), true))
-        .scroll((state.raw_popup_scroll, 0))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(selectable_text(
+        state,
+        TuiSelectionBlock::RawPopup,
+        state.raw_popup_text(),
+    ))
+    .block(focused_block("Raw Body  Esc/q close".to_string(), true))
+    .scroll((state.raw_popup_scroll, 0))
+    .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn stats_lines(session: &TuiSession) -> Vec<String> {
+    let session_path = session.path.display().to_string();
+    vec![
+        format!(
+            "Session {}  CWD {}",
+            short(&session.session_id, 36),
+            short(&session.cwd, 60)
+        ),
+        format!(
+            "messages:{} lines:{} compactions:{} tokens:{} context:{}",
+            session.messages,
+            session.lines,
+            session.compactions,
+            compact_number(session.total_tokens),
+            compact_number(session.model_context_window)
+        ),
+        short(&session_path, 120),
+    ]
+}
+
+fn compaction_lines_text(session: &TuiSession) -> Vec<String> {
+    if session.parsed.compaction_events.is_empty() {
+        return vec!["No compaction events in this session.".to_string()];
+    }
+
+    session
+        .parsed
+        .compaction_events
+        .iter()
+        .enumerate()
+        .take(3)
+        .map(|(index, event)| {
+            let tokens = event
+                .token_usage
+                .as_ref()
+                .map(|usage| compact_number(usage.total_tokens))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{}. line {} trigger:{} tokens:{} summary:{} chars",
+                index + 1,
+                event.line_number,
+                empty_dash(&event.trigger),
+                tokens,
+                event.summary_length()
+            )
+        })
+        .collect()
 }
 
 fn session_row(parsed: ParsedSession) -> TuiSession {
@@ -1366,6 +1835,14 @@ fn short(value: &str, limit: usize) -> String {
     format!("{}...", value.chars().take(limit - 3).collect::<String>())
 }
 
+fn slice_chars(value: &str, start: usize, end: usize) -> String {
+    value
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
 fn short_time(value: &str) -> String {
     if value.len() >= 19 {
         value[11..19].to_string()
@@ -1425,6 +1902,14 @@ mod tests {
         assert!(
             rendered.contains(&format!("cxv {}", env!("CARGO_PKG_VERSION"))),
             "rendered buffer did not include package version: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn osc52_copy_sequence_encodes_selected_text() {
+        assert_eq!(
+            osc52_copy_sequence("function_call"),
+            "\x1b]52;c;ZnVuY3Rpb25fY2FsbA==\x07"
         );
     }
 }
