@@ -65,6 +65,12 @@ Open the interactive viewer with the raw body popup already visible:
 cxv --tui --raw-bodies ~/.codex/sessions/2026/04/25/rollout-example.jsonl
 ```
 
+Open the interactive viewer with native terminal text selection enabled immediately:
+
+```bash
+cxv --tui --no-mouse ~/.codex/sessions/2026/04/25/rollout-example.jsonl
+```
+
 Scan active Codex sessions:
 
 ```bash
@@ -118,6 +124,7 @@ Keybindings:
 | `/` | Edit session search text |
 | `g` | Toggle sessions with compaction events only |
 | `v` | Toggle tidy / verbose history mode |
+| `m` | Toggle mouse capture; when off, terminal text selection works normally |
 | `r` | Open/close raw request/response body popup |
 | `c` / `C` | Jump to next / previous compaction point |
 | `s` | Toggle all compaction summaries in the detail panel |
@@ -133,6 +140,8 @@ Mouse support:
 | Left click detail | Focus detail |
 | Wheel | Move history/session selection, or scroll detail/raw popup |
 | Right click raw popup | Close popup |
+
+Press `m` or start with `--no-mouse` to disable mouse capture when you need to select text in the terminal. Click and wheel navigation are inactive while mouse capture is off; press `m` again to re-enable them.
 
 ## Data Model
 

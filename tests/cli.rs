@@ -138,3 +138,19 @@ fn tui_raw_bodies_flag_is_accepted() {
     );
     assert!(stdout.contains("Interactive TUI requires a terminal"));
 }
+
+#[test]
+fn tui_no_mouse_flag_is_accepted() {
+    let output = cxv()
+        .args(["--tui", "--no-mouse"])
+        .output()
+        .expect("run cxv");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Interactive TUI requires a terminal"));
+}

@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(long)]
     pub raw_bodies: bool,
 
+    /// Start the TUI without mouse capture so terminal text selection works immediately.
+    #[arg(long)]
+    pub no_mouse: bool,
+
     /// Print version information.
     #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
     pub version: bool,
@@ -128,6 +132,7 @@ pub fn main_entry() -> i32 {
             args.file.as_deref(),
             args.mode.into(),
             args.raw_bodies,
+            !args.no_mouse,
         ) {
             Ok(()) => 0,
             Err(error) => {

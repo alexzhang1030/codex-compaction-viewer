@@ -402,6 +402,42 @@ fn tui_r_key_opens_raw_body_popup_by_default() {
 }
 
 #[test]
+fn tui_mouse_capture_can_be_toggled_for_terminal_selection() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_mixed_session(&tmp.path().join("sessions/2026/04/25/rollout-mixed.jsonl"));
+
+    let model = build_tui_model(Some(tmp.path()), false, None).expect("build model");
+    let mut state = TuiState::new(model);
+    let area = Rect::new(0, 0, 120, 40);
+    let initial_line = state.selected_message_line();
+
+    assert!(state.mouse_capture_enabled());
+    assert!(state.footer_help_text().contains("m mouse:on"));
+
+    handle_key(&mut state, key(KeyCode::Char('m')));
+
+    assert!(!state.mouse_capture_enabled());
+    assert!(state.footer_help_text().contains("m mouse:off"));
+
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 42, 13),
+        area,
+    );
+
+    assert_eq!(state.selected_message_line(), initial_line);
+
+    handle_key(&mut state, key(KeyCode::Char('m')));
+    handle_mouse(
+        &mut state,
+        mouse(MouseEventKind::Down(MouseButton::Left), 42, 13),
+        area,
+    );
+
+    assert_eq!(state.selected_message_line(), Some(6));
+}
+
+#[test]
 fn tui_mouse_clicks_select_history_and_wheel_scrolls_detail() {
     let tmp = TempDir::new().expect("tempdir");
     write_mixed_session(&tmp.path().join("sessions/2026/04/25/rollout-mixed.jsonl"));

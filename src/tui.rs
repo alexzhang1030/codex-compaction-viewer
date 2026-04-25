@@ -91,6 +91,7 @@ pub struct TuiState {
     focus: TuiFocus,
     detail_scroll: u16,
     raw_popup_scroll: u16,
+    mouse_capture_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,13 +158,22 @@ pub fn launch(
     initial_file: Option<&Path>,
     display_mode: TuiDisplayMode,
     raw_bodies_enabled: bool,
+    mouse_capture_enabled: bool,
 ) -> Result<()> {
     let model = build_tui_model(root, include_archived, initial_file)?;
-    let mut state = TuiState::with_options(model, display_mode, raw_bodies_enabled);
+    let mut state = TuiState::with_terminal_options(
+        model,
+        display_mode,
+        raw_bodies_enabled,
+        mouse_capture_enabled,
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    if state.mouse_capture_enabled {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -194,6 +204,15 @@ impl TuiState {
         display_mode: TuiDisplayMode,
         raw_bodies_enabled: bool,
     ) -> Self {
+        Self::with_terminal_options(model, display_mode, raw_bodies_enabled, true)
+    }
+
+    pub fn with_terminal_options(
+        model: TuiModel,
+        display_mode: TuiDisplayMode,
+        raw_bodies_enabled: bool,
+        mouse_capture_enabled: bool,
+    ) -> Self {
         Self {
             selected_message: 0,
             model,
@@ -205,6 +224,7 @@ impl TuiState {
             focus: TuiFocus::History,
             detail_scroll: 0,
             raw_popup_scroll: 0,
+            mouse_capture_enabled,
         }
     }
 
@@ -260,11 +280,20 @@ impl TuiState {
         self.display_mode
     }
 
+    pub fn mouse_capture_enabled(&self) -> bool {
+        self.mouse_capture_enabled
+    }
+
     pub fn footer_help_text(&self) -> String {
         let compacted_filter = if self.filter_compacted_sessions {
             "compacted:on"
         } else {
             "compacted:off"
+        };
+        let mouse_capture = if self.mouse_capture_enabled {
+            "mouse:on"
+        } else {
+            "mouse:off"
         };
         let focus = match self.focus {
             TuiFocus::History => "history",
@@ -272,7 +301,7 @@ impl TuiState {
             TuiFocus::SessionSearch => "search",
         };
         format!(
-            "q quit | / search | r raw | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
+            "q quit | / search | r raw | m {mouse_capture} | g {compacted_filter} | v mode:{} | Enter detail | j/k {focus} | h/l sessions | c/C compactions | s summaries",
             self.display_mode.as_str()
         )
     }
@@ -598,6 +627,10 @@ impl TuiState {
         self.raw_popup_scroll = 0;
     }
 
+    fn toggle_mouse_capture(&mut self) {
+        self.mouse_capture_enabled = !self.mouse_capture_enabled;
+    }
+
     fn move_session(&mut self, delta: isize) {
         let indices = self.visible_session_indices();
         if indices.is_empty() {
@@ -655,9 +688,15 @@ fn run_terminal(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
+                    let previous_mouse_capture = state.mouse_capture_enabled();
                     if handle_key(state, key) {
                         return Ok(());
                     }
+                    sync_mouse_capture(
+                        terminal,
+                        previous_mouse_capture,
+                        state.mouse_capture_enabled(),
+                    )?;
                 }
                 Event::Mouse(mouse) => {
                     let size = terminal.size()?;
@@ -670,6 +709,22 @@ fn run_terminal(
     }
 }
 
+fn sync_mouse_capture(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    previous: bool,
+    current: bool,
+) -> Result<()> {
+    if previous == current {
+        return Ok(());
+    }
+    if current {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    Ok(())
+}
+
 pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if state.show_raw_popup {
         match key.code {
@@ -678,6 +733,7 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Char('k') | KeyCode::Up => state.scroll_raw_popup(-1),
             KeyCode::PageDown => state.scroll_raw_popup(10),
             KeyCode::PageUp => state.scroll_raw_popup(-10),
+            KeyCode::Char('m') => state.toggle_mouse_capture(),
             _ => {}
         }
         return false;
@@ -711,6 +767,7 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Char('k') | KeyCode::Up => state.scroll_detail(-1),
             KeyCode::PageDown => state.scroll_detail(10),
             KeyCode::PageUp => state.scroll_detail(-10),
+            KeyCode::Char('m') => state.toggle_mouse_capture(),
             _ => {}
         }
         return false;
@@ -740,6 +797,7 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.detail_scroll = 0;
         }
         KeyCode::Char('v') => state.toggle_display_mode(),
+        KeyCode::Char('m') => state.toggle_mouse_capture(),
         KeyCode::Char('r') => state.toggle_raw_popup(),
         _ => {}
     }
@@ -747,6 +805,10 @@ pub fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
 }
 
 pub fn handle_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
+    if !state.mouse_capture_enabled {
+        return;
+    }
+
     let layout = tui_layout(area);
     if state.show_raw_popup {
         match mouse.kind {
