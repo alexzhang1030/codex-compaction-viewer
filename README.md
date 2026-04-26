@@ -176,5 +176,5 @@ bash scripts/test-quality.sh
 This runs:
 
 - `cargo test`
-- `cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines ${COVERAGE_FLOOR:-75}`
+- `cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines ${COVERAGE_FLOOR:-85}`
 - `cargo mutants --workspace --in-place --baseline=skip --file src/cli.rs --file src/parser.rs --file src/tui.rs`

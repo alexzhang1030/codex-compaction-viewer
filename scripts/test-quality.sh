@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-coverage_floor="${COVERAGE_FLOOR:-75}"
+coverage_floor="${COVERAGE_FLOOR:-85}"
 mutation_timeout="${MUTATION_TIMEOUT:-120}"
 
 cargo test

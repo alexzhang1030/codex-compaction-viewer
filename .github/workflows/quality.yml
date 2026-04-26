@@ -28,7 +28,7 @@ jobs:
 
       - name: Enforce coverage floor and mutation checks
         env:
-          COVERAGE_FLOOR: "75"
+          COVERAGE_FLOOR: "85"
           MUTATION_TIMEOUT: "120"
         run: bash scripts/test-quality.sh
 
