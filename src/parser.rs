@@ -1080,3 +1080,254 @@ impl EmptyFallback for String {
         (!self.is_empty()).then_some(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn summary_and_content_helpers_normalize_values() {
+        assert_eq!(content_text(Some(&json!("plain text"))), "plain text");
+        assert_eq!(
+            content_text(Some(&json!([
+                "alpha",
+                {"text": "beta"},
+                {"summary": "gamma"}
+            ]))),
+            "alpha\nbeta\ngamma"
+        );
+        assert_eq!(
+            message_text(Some(&json!({"content": [{"text": "hello"}]}))),
+            "hello"
+        );
+        assert_eq!(summary_text(Some(&json!(" manual "))), "");
+        assert_eq!(
+            summary_text(Some(&json!({"summary": "Useful summary"}))),
+            "Useful summary"
+        );
+        assert_eq!(
+            summary_text(Some(&json!([" one ", {"text": "two"}]))),
+            "one \ntwo"
+        );
+    }
+
+    #[test]
+    fn event_and_response_messages_cover_supported_shapes() {
+        let user = message_from_event(
+            1,
+            "2026-04-25T12:00:00Z",
+            json!({"type": "user_message", "message": "hello"})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(user.role, "user");
+        assert_eq!(user.content, "hello");
+
+        let exec = message_from_event(
+            2,
+            "2026-04-25T12:00:01Z",
+            json!({"type": "exec_command_end", "status": "ok", "command": ["git", "status"]})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(exec.role, "tool");
+        assert_eq!(exec.content, "git status ok");
+
+        let token = message_from_event(
+            3,
+            "2026-04-25T12:00:02Z",
+            json!({"type": "token_count", "info": {"total_token_usage": {"total_tokens": 1234}}})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(token.role, "system");
+        assert_eq!(token.content, "tokens=1234");
+
+        let fallback = message_from_event(
+            4,
+            "2026-04-25T12:00:03Z",
+            json!({"type": "other", "text": "fallback text"})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(fallback.content, "fallback text");
+
+        let function_call = message_from_response_item(
+            5,
+            "2026-04-25T12:00:04Z",
+            json!({"type": "function_call", "name": "read_file"})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(function_call.role, "tool_call");
+        assert_eq!(function_call.content, "read_file");
+
+        let function_output = message_from_response_item(
+            6,
+            "2026-04-25T12:00:05Z",
+            json!({"type": "function_call_output", "call_id": "call-1"})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(function_output.role, "tool");
+        assert_eq!(function_output.content, "call-1");
+
+        let assistant = message_from_response_item(
+            7,
+            "2026-04-25T12:00:06Z",
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"text": "done"}, {"summary": "summary"}]
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.content, "done\nsummary");
+    }
+
+    #[test]
+    fn boundary_and_raw_record_helpers_extract_metadata() {
+        let boundary_record = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {
+                "trigger": "manual",
+                "tokens_before": "456"
+            }
+        });
+        let boundary = parse_raw_boundary(
+            9,
+            "2026-04-25T12:00:00Z",
+            boundary_record.as_object().unwrap(),
+        )
+        .expect("boundary");
+        assert_eq!(boundary.line_number, 9);
+        assert_eq!(boundary.trigger, "manual");
+        assert_eq!(
+            boundary.token_usage.as_ref().expect("token usage").total_tokens,
+            456
+        );
+
+        let compact_summary = parse_raw_compact_summary(
+            10,
+            "2026-04-25T12:00:02Z",
+            json!({
+                "type": "user",
+                "isCompactSummary": true,
+                "compactSummary": "Recovered summary",
+                "id": "compact-1"
+            })
+            .as_object()
+            .unwrap(),
+            Some(&boundary),
+        )
+        .expect("summary");
+        assert_eq!(compact_summary.source, "boundary_summary");
+        assert_eq!(compact_summary.boundary_line_number, Some(9));
+        assert_eq!(compact_summary.turn_id, "compact-1");
+        assert_eq!(compact_summary.summary, "Recovered summary");
+
+        let raw_message = message_from_raw_record(
+            11,
+            "2026-04-25T12:00:03Z",
+            json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "auto"}
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!(raw_message.kind, "compact_boundary");
+        assert_eq!(raw_message.content, "compact boundary auto");
+
+        assert!(is_raw_compact_summary(
+            json!({"type": "user", "isCompactSummary": true})
+                .as_object()
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn token_and_scalar_helpers_cover_fallbacks() {
+        let mut stats = ConversationStats::default();
+        let usage = apply_token_count(
+            &mut stats,
+            json!({
+                "info": {
+                    "model_context_window": "258400",
+                    "total_token_usage": {
+                        "input_tokens": 11,
+                        "cached_input_tokens": 5,
+                        "output_tokens": 7,
+                        "reasoning_output_tokens": 3,
+                        "total_tokens": 26
+                    }
+                }
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .expect("usage");
+        assert_eq!(usage.total_tokens, 26);
+        assert_eq!(stats.model_context_window, 258400);
+        assert_eq!(stats.cached_input_tokens, 5);
+
+        update_time_bounds(&mut stats, "2026-04-25T12:01:00Z");
+        update_time_bounds(&mut stats, "2026-04-25T11:59:00Z");
+        assert_eq!(stats.first_timestamp, "2026-04-25T11:59:00Z");
+        assert_eq!(stats.last_timestamp, "2026-04-25T12:01:00Z");
+
+        assert_eq!(string(Some(&json!(true))), "true");
+        assert_eq!(int(Some(&json!("42"))), 42);
+        assert_eq!(int_or_none(Some(&json!(null))), None);
+        assert_eq!(
+            first_int(
+                json!({"one": "1", "two": 2}).as_object().unwrap(),
+                &["missing", "two"]
+            ),
+            Some(2)
+        );
+
+        let mut target = String::from("kept");
+        assign_if_present(&mut target, String::new());
+        assert_eq!(target, "kept");
+        assign_if_present(&mut target, "new".to_string());
+        assert_eq!(target, "new");
+        assert_eq!(String::new().or_else_empty("fallback".to_string()), "fallback");
+    }
+
+    #[test]
+    fn turn_context_parser_requires_non_empty_summary() {
+        let usage = Some(TokenUsage {
+            total_tokens: 99,
+            ..TokenUsage::default()
+        });
+        let event = parse_turn_context(
+            12,
+            "2026-04-25T12:00:00Z",
+            json!({
+                "turn_id": "turn-1",
+                "summary": "Condensed state",
+                "truncation_policy": {"mode": "tokens", "limit": "12000"}
+            })
+            .as_object()
+            .unwrap(),
+            usage.clone(),
+        )
+        .expect("turn context event");
+        assert_eq!(event.turn_id, "turn-1");
+        assert_eq!(event.truncation_limit, Some(12000));
+        assert_eq!(event.token_usage, usage);
+        assert!(parse_turn_context(
+            13,
+            "2026-04-25T12:00:01Z",
+            json!({"summary": "none"}).as_object().unwrap(),
+            None
+        )
+        .is_none());
+    }
+}

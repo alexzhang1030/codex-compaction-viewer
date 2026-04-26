@@ -1,5 +1,10 @@
 # Codex Compaction Viewer
 
+[![quality](https://github.com/alexzhang1030/codex-compaction-viewer/actions/workflows/quality.yml/badge.svg)](https://github.com/alexzhang1030/codex-compaction-viewer/actions/workflows/quality.yml)
+[![release](https://github.com/alexzhang1030/codex-compaction-viewer/actions/workflows/release.yml/badge.svg)](https://github.com/alexzhang1030/codex-compaction-viewer/actions/workflows/release.yml)
+[![line coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/alexzhang1030/codex-compaction-viewer/main/badges/coverage.json)](https://github.com/alexzhang1030/codex-compaction-viewer/actions/workflows/quality.yml)
+[![latest release](https://img.shields.io/github/v/release/alexzhang1030/codex-compaction-viewer)](https://github.com/alexzhang1030/codex-compaction-viewer/releases)
+
 Inspect local Codex JSONL sessions for context summary snapshots, token usage, and truncation policy metadata.
 
 `cxv` is a Rust binary. It does not require Python at runtime.
@@ -161,3 +166,15 @@ The parser follows the same resilient JSON/JSONL loading shape used by Euphony: 
 cargo test
 cargo run -- --scan --include-archived
 ```
+
+Quality gate with coverage and mutation testing:
+
+```bash
+bash scripts/test-quality.sh
+```
+
+This runs:
+
+- `cargo test`
+- `cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines ${COVERAGE_FLOOR:-75}`
+- `cargo mutants --workspace --in-place --baseline=skip --file src/cli.rs --file src/parser.rs --file src/tui.rs`

@@ -154,3 +154,93 @@ fn tui_no_mouse_flag_is_accepted() {
     );
     assert!(stdout.contains("Interactive TUI requires a terminal"));
 }
+
+#[test]
+fn invalid_args_exit_with_parse_error() {
+    let output = cxv().arg("--no-such-flag").output().expect("run cxv");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}
+
+#[test]
+fn missing_file_exits_with_runtime_error() {
+    let output = cxv()
+        .args(["--summary", "/definitely/missing/session.jsonl"])
+        .output()
+        .expect("run cxv");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to open"));
+}
+
+#[test]
+fn summary_handles_empty_and_multi_event_sessions() {
+    let tmp = TempDir::new().expect("tempdir");
+    let empty_session = tmp.path().join("empty.jsonl");
+    write_session(&empty_session);
+    fs::write(
+        &empty_session,
+        "{\"timestamp\":\"2026-04-25T12:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+    )
+    .expect("overwrite empty session");
+
+    let empty_output = cxv()
+        .args(["--summary", empty_session.to_str().unwrap()])
+        .output()
+        .expect("run empty summary");
+    assert!(empty_output.status.success());
+    assert!(String::from_utf8_lossy(&empty_output.stdout).contains("No Codex context summary events found."));
+
+    let multi_session = tmp.path().join("multi.jsonl");
+    let rows = vec![
+        json!({
+            "timestamp": "2026-04-25T12:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"total_tokens": 2_500_000}
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-04-25T12:01:00Z",
+            "type": "turn_context",
+            "payload": {
+                "turn_id": "turn-one",
+                "summary": "First summary",
+                "truncation_policy": {"mode": "tokens", "limit": 100}
+            }
+        }),
+        json!({
+            "timestamp": "2026-04-25T12:02:00Z",
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compactMetadata": {"trigger": "auto", "preCompactTokens": 42}
+        }),
+        json!({
+            "timestamp": "2026-04-25T12:02:01Z",
+            "type": "user",
+            "isCompactSummary": true,
+            "message": {"content": [{"type": "text", "text": "Second summary"}]}
+        }),
+    ];
+    let mut file = fs::File::create(&multi_session).expect("create multi fixture");
+    for row in rows {
+        writeln!(file, "{row}").expect("write multi row");
+    }
+
+    let output = cxv()
+        .args(["--summary", multi_session.to_str().unwrap()])
+        .output()
+        .expect("run multi summary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("#1 line 2 turn turn-one"));
+    assert!(stdout.contains("#2 line 4 boundary 3"));
+    assert!(stdout.contains("trigger: auto"));
+    assert!(stdout.contains("tokens before: 2.5m"));
+    assert!(stdout.contains("First summary"));
+    assert!(stdout.contains("Second summary"));
+}

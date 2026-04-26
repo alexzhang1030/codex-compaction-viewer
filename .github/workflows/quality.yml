@@ -1,0 +1,64 @@
+name: quality
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - badges/coverage.json
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install coverage and mutation tools
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo install cargo-mutants --locked
+
+      - name: Enforce coverage floor and mutation checks
+        env:
+          COVERAGE_FLOOR: "75"
+          MUTATION_TIMEOUT: "120"
+        run: bash scripts/test-quality.sh
+
+      - name: Refresh coverage badge payload
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          summary="$(cargo llvm-cov --workspace --all-features --summary-only)"
+          printf '%s\n' "$summary"
+          coverage="$(printf '%s\n' "$summary" | awk '/^TOTAL/ {print $(NF-3)}')"
+          coverage="${coverage%\%}"
+          test -n "$coverage"
+          color="red"
+          awk "BEGIN { exit !($coverage >= 95) }" && color="brightgreen" || true
+          awk "BEGIN { exit !($coverage >= 90 && $coverage < 95) }" && color="green" || true
+          awk "BEGIN { exit !($coverage >= 80 && $coverage < 90) }" && color="yellow" || true
+          mkdir -p badges
+          cat > badges/coverage.json <<EOF
+          {"schemaVersion":1,"label":"line coverage","message":"${coverage}%","color":"${color}"}
+          EOF
+
+      - name: Commit coverage badge payload
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          if git diff --quiet -- badges/coverage.json; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add badges/coverage.json
+          git commit -m "ci: update coverage badge"
+          git push
